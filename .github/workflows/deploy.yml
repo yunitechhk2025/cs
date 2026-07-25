@@ -10,7 +10,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Prepare .env on runner
+      - name: Prepare .env (base64)
+        id: prepare_env
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
@@ -43,12 +44,12 @@ jobs:
             exit 1
           fi
 
-          # 未在 Secrets 配置时写占位符，由服务器沿用旧值或首次生成
           JWT_VAL="${JWT_SECRET:-__PRESERVE_OR_GENERATE__}"
           ADMIN_PW_VAL="${ADMIN_PASSWORD:-__PRESERVE_OR_DEFAULT__}"
 
+          ENV_FILE="$RUNNER_TEMP/cs.env"
           umask 077
-          cat > "$GITHUB_WORKSPACE/cs.env" <<EOF
+          cat > "$ENV_FILE" <<EOF
           OPENAI_API_KEY=${API_KEY}
           OPENAI_MODEL=${OPENAI_MODEL:-qwen3.6-flash}
           OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
@@ -72,37 +73,16 @@ jobs:
           SMTP_USE_SSL=${SMTP_USE_SSL:-false}
           NOTIFY_EMAIL_TO=${NOTIFY_EMAIL_TO:-}
           EOF
-          sed -i 's/^[[:space:]]*//' "$GITHUB_WORKSPACE/cs.env"
-          # scp-action 跑在 Docker 里，需要能读到工作区文件；勿用 600
-          chmod 644 "$GITHUB_WORKSPACE/cs.env"
-          echo "Prepared cs.env for upload"
+          sed -i 's/^[[:space:]]*//' "$ENV_FILE"
 
-      - name: Ensure remote directory
+          B64=$(base64 -w0 "$ENV_FILE")
+          echo "env_b64=${B64}" >> "$GITHUB_OUTPUT"
+          echo "Prepared .env as base64 (${#B64} chars)"
+
+      - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.ECS_HOST }}
-          username: ${{ secrets.ECS_USER }}
-          password: ${{ secrets.ECS_PASSWORD }}
-          port: 22
-          script_stop: true
-          script: |
-            set -e
-            echo "==> prepare ~/cs"
-            mkdir -p ~/cs/data
-
-      - name: Upload .env
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.ECS_HOST }}
-          username: ${{ secrets.ECS_USER }}
-          password: ${{ secrets.ECS_PASSWORD }}
-          port: 22
-          source: "cs.env"
-          target: "~/cs/"
-          overwrite: true
-
-      - name: Deploy code and restart container
-        uses: appleboy/ssh-action@v1.2.0
+        env:
+          ENV_B64: ${{ steps.prepare_env.outputs.env_b64 }}
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
@@ -110,17 +90,20 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 30m
+          envs: ENV_B64
           script: |
             set -e
-            echo "==> enter ~/cs"
+            echo "==> prepare ~/cs"
+            mkdir -p ~/cs/data
             cd ~/cs
             pwd
 
-            if [ ! -f cs.env ]; then
-              echo "ERROR: cs.env was not uploaded" >&2
+            if [ -z "${ENV_B64:-}" ]; then
+              echo "ERROR: ENV_B64 is empty (Actions output not passed)" >&2
               exit 1
             fi
 
+            echo "==> decode .env"
             OLD_JWT=""
             OLD_ADMIN_PW=""
             if [ -f .env ]; then
@@ -128,7 +111,7 @@ jobs:
               OLD_ADMIN_PW=$(grep -E '^ADMIN_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)
             fi
 
-            mv -f cs.env .env
+            echo "$ENV_B64" | base64 -d > .env
             chmod 600 .env
 
             if grep -q '^JWT_SECRET=__PRESERVE_OR_GENERATE__$' .env; then
@@ -156,7 +139,6 @@ jobs:
             if [ ! -d .git ]; then
               TMPDIR=$(mktemp -d)
               git clone https://github.com/yunitechhk2025/cs.git "$TMPDIR/repo"
-              # 同步代码，保留 .env 与 data
               find "$TMPDIR/repo" -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} ~/cs/ \;
               cp -a "$TMPDIR/repo/.git" ~/cs/
               rm -rf "$TMPDIR"
