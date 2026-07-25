@@ -20,6 +20,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from excel_rag_chatbot import AnswerResult
+from kb_desensitize import desensitize
 
 NO_ANSWER_TOKEN = "NO_ANSWER"
 
@@ -81,6 +82,10 @@ class DocRagBot:
     def build_index(self) -> None:
         with open(self.doc_path, "r", encoding="utf-8") as f:
             raw_text = f.read()
+
+        # 脱敏版：文档原文里的真实品牌名/创始人姓名先替换掉再解析，AI 只能看到脱敏后的资料，
+        # 也就不可能把真实品牌写进回答里（见 kb_desensitize.py）。
+        raw_text = desensitize(raw_text)
 
         items = self._parse_doc(raw_text)
         if not items:

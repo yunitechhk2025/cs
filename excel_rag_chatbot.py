@@ -12,6 +12,8 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from kb_desensitize import desensitize
+
 
 @dataclass
 class FaqItem:
@@ -108,8 +110,11 @@ class ExcelFaqRagBot:
                     sheet=sheet_name,
                     row_index=int(idx),
                     serial=serial,
-                    question=question,
-                    answer=answer,
+                    # 脱敏版：题库原文里的真实品牌名/创始人姓名在这里就替换掉，答案是原文照搬
+                    # 发给客户的，不在加载时替换，客户就会看到真实品牌（见 kb_desensitize.py）。
+                    # 共用问题的判定用替换前的原文，避免脱敏后跟 _LEGACY_SHARED_QUESTIONS 对不上。
+                    question=desensitize(question),
+                    answer=desensitize(answer),
                     shared=self._is_shared_question(serial, question),
                 )
             )

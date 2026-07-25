@@ -315,6 +315,50 @@
         background: #e6ddf5;
       }
 
+      /* 已选中但还没发送的图片：挂在输入框上方，跟文字一起发送。 */
+      .attachment-preview {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px 0;
+      }
+
+      .attachment-thumb-wrap {
+        position: relative;
+        flex: 0 0 auto;
+        line-height: 0;
+      }
+
+      .attachment-thumb-wrap img {
+        width: 56px;
+        height: 56px;
+        object-fit: cover;
+        border-radius: 10px;
+        border: 1px solid #d7dfec;
+      }
+
+      .attachment-remove {
+        position: absolute;
+        top: -6px;
+        right: -6px;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        border-radius: 50%;
+        background: #172033;
+        color: #ffffff;
+        font-size: 14px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .attachment-tip {
+        font-size: 12px;
+        color: #9aa3b5;
+      }
+
       /* 聊天气泡里的图片：限制尺寸，点击可在新标签页看原图。 */
       .message img.chat-image {
         display: block;
@@ -470,6 +514,23 @@
         </div>
 
         <div class="composer-wrap">
+          <!-- 已选中但还没发送的图片：点发送时才和文字一起送出，也可以点 × 撤掉 -->
+          <div id="attachment-preview" class="attachment-preview" style="display: none">
+            <div class="attachment-thumb-wrap">
+              <img id="attachment-thumb" alt="待发送的图片" />
+              <button
+                id="attachment-remove"
+                class="attachment-remove"
+                type="button"
+                title="移除这张图片"
+                aria-label="移除这张图片"
+              >
+                ×
+              </button>
+            </div>
+            <span class="attachment-tip">图片将与您输入的文字一起发送</span>
+          </div>
+
           <form id="form" class="composer">
             <div class="input-box">
               <button id="attach" class="attach-btn" type="button" title="发送图片" aria-label="发送图片">+</button>
@@ -520,6 +581,16 @@
       const send = document.getElementById("send");
       const attachBtn = document.getElementById("attach");
       const imageInput = document.getElementById("image-input");
+      const attachmentPreview = document.getElementById("attachment-preview");
+      const attachmentThumb = document.getElementById("attachment-thumb");
+      const attachmentRemove = document.getElementById("attachment-remove");
+
+      // 选中图片不等于立刻发出：先挂在输入框上方当"待发送附件"，客户可以接着打字，点发送时
+      // 图片和文字一起送出（图片先上传，再把文字问题发给 /api/ask，服务端会把这张图的识别
+      // 描述并进这次提问一起检索）。这样"发图 + 说明想问什么"是一次完整的表达，而不是两条
+      // 各自孤立的消息。
+      let pendingImageFile = null;
+      let pendingImagePreviewUrl = null;
       const messages = document.getElementById("messages");
       const pickerOverlay = document.getElementById("product-picker-overlay");
       const pickerOptions = document.getElementById("picker-options");
@@ -557,6 +628,8 @@
         } else {
           input.placeholder = "本次对话已结束";
           input.blur();
+          // 对话已结束就不可能再发出去了，顺手把还挂着的待发送图片撤掉。
+          clearPendingImage();
         }
       }
 
@@ -1442,10 +1515,9 @@
         }
       }
 
-      // 发送图片：点加号按钮唤起系统文件选择框（手机上即相册/拍照），选中后先传到服务器
-      // 拿到 URL，再作为一条 kind=image 的气泡显示并落库——客服工作台的对话流里也能看到。
-      // 服务端会同时调视觉模型把图片内容转成文字描述暂存起来，客户接下来提问时自动并进问题
-      // 一起检索（见 web_app.py 的 /api/upload-image 和 /api/ask）。
+      // 发送图片：点加号按钮唤起系统文件选择框（手机上即相册/拍照）。选中的图片不会立刻发出，
+      // 而是先挂在输入框上方等客户把想问的话打完，点发送时一起送出（见下面的 setPendingImage /
+      // sendPendingImage 和 form 的 submit 处理）。
       attachBtn.addEventListener("click", () => {
         if (sessionEnded) return;
         if (!currentProduct) {
@@ -1481,7 +1553,26 @@
         }, IMAGE_FOLLOWUP_MS);
       }
 
-      imageInput.addEventListener("change", async () => {
+      function clearPendingImage() {
+        pendingImageFile = null;
+        if (pendingImagePreviewUrl) {
+          URL.revokeObjectURL(pendingImagePreviewUrl);
+          pendingImagePreviewUrl = null;
+        }
+        attachmentThumb.removeAttribute("src");
+        attachmentPreview.style.display = "none";
+      }
+
+      function setPendingImage(file) {
+        clearPendingImage();
+        pendingImageFile = file;
+        // 用本地 objectURL 做缩略图，不必等上传完成就能让客户看到自己选了哪张图。
+        pendingImagePreviewUrl = URL.createObjectURL(file);
+        attachmentThumb.src = pendingImagePreviewUrl;
+        attachmentPreview.style.display = "flex";
+      }
+
+      imageInput.addEventListener("change", () => {
         const file = imageInput.files && imageInput.files[0];
         imageInput.value = ""; // 允许连续两次选同一张图也能触发 change
         if (!file || sessionEnded) return;
@@ -1489,38 +1580,40 @@
           addMessage("图片不能超过 5MB，请压缩后重试～", "bot");
           return;
         }
-
-        clearIdleTimer();
-        clearImageFollowup();
-        dismissIdlePromptButtons();
-        attachBtn.disabled = true;
-        try {
-          const fd = new FormData();
-          fd.append("file", file);
-          // 带上会话 id，服务端才知道这张图的识别结果该跟哪个客户的下一次提问合并。
-          fd.append("session_id", getSessionId());
-          const res = await fetch("/api/upload-image", { method: "POST", body: fd });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok || !data.url) {
-            throw new Error(data.detail || "上传失败，请稍后重试");
-          }
-          const imageEl = addImageMessage(data.url, "user");
-          scheduleImageFollowup(imageEl);
-        } catch (err) {
-          addMessage(`图片发送失败：${err.message}`, "bot");
-        } finally {
-          if (!sessionEnded) {
-            attachBtn.disabled = false;
-          }
-          scheduleIdleEndPrompt();
-        }
+        setPendingImage(file);
+        input.focus();
       });
+
+      attachmentRemove.addEventListener("click", () => {
+        clearPendingImage();
+        input.focus();
+      });
+
+      // 把待发送的图片真正传到服务器并显示成一条图片气泡，返回那个气泡（供追问时定位插入位置）。
+      // 上传的同时服务端会调视觉模型生成图片的文字描述并暂存，紧接着的那次提问会自动带上它。
+      async function sendPendingImage() {
+        const file = pendingImageFile;
+        if (!file) return null;
+        const fd = new FormData();
+        fd.append("file", file);
+        // 带上会话 id，服务端才知道这张图的识别结果该跟哪个客户的下一次提问合并。
+        fd.append("session_id", getSessionId());
+        const res = await fetch("/api/upload-image", { method: "POST", body: fd });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.url) {
+          throw new Error(data.detail || "上传失败，请稍后重试");
+        }
+        clearPendingImage();
+        return addImageMessage(data.url, "user");
+      }
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (sessionEnded) return;
         const text = input.value.trim();
-        if (!text) return;
+        const hasPendingImage = !!pendingImageFile;
+        // 只要有图片，即使一个字都没打也允许发送（发完会在 10 秒后追问想咨询什么）。
+        if (!text && !hasPendingImage) return;
         if (!currentProduct) {
           pickerOverlay.style.display = "flex";
           return;
@@ -1531,6 +1624,30 @@
         // 图片的识别描述并进这次提问里一起检索。
         clearImageFollowup();
         dismissIdlePromptButtons();
+
+        if (hasPendingImage) {
+          send.disabled = true;
+          attachBtn.disabled = true;
+          let imageEl = null;
+          try {
+            imageEl = await sendPendingImage();
+          } catch (err) {
+            // 上传失败时保留输入框里的文字和这张待发送的图片，客户可以直接再点一次发送重试。
+            addMessage(`图片发送失败：${err.message}`, "bot");
+            send.disabled = false;
+            attachBtn.disabled = false;
+            scheduleIdleEndPrompt();
+            return;
+          }
+          if (!text) {
+            // 只发了图片没打字：等 10 秒还没说想问什么就主动追问一句。
+            scheduleImageFollowup(imageEl);
+            send.disabled = false;
+            attachBtn.disabled = false;
+            input.focus();
+            return;
+          }
+        }
 
         input.value = "";
         addMessage(text, "user");
@@ -1575,6 +1692,7 @@
         } finally {
           if (!sessionEnded) {
             send.disabled = false;
+            attachBtn.disabled = false;
             input.focus();
           }
         }
