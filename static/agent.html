@@ -516,6 +516,14 @@
         border-top-right-radius: 4px;
       }
 
+      /* 客户发送的图片：气泡里显示缩略图，点击在新标签页看原图。 */
+      .bubble img.chat-image {
+        display: block;
+        max-width: min(260px, 100%);
+        max-height: 260px;
+        border-radius: 8px;
+      }
+
       .bubble-block {
         margin-bottom: 14px;
       }
@@ -1769,6 +1777,22 @@
       }
 
       function renderMessageBlock(item) {
+        // 客户发送的图片没有对应的 conversations 行（AI 不处理图片），后端把它们按时间
+        // 插入到问答流中（item_type=image），这里渲染成一个只有图片气泡的块，不带回复框。
+        if (item.item_type === "image") {
+          const url = escapeHtml(item.image_url || "");
+          return `
+          <div class="bubble-block">
+            <div class="bubble-row customer">
+              <div class="bubble-avatar customer" title="客户">🧑</div>
+              <div class="bubble customer"><a href="${url}" target="_blank" rel="noopener"><img class="chat-image" src="${url}" alt="客户发送的图片" loading="lazy" /></a></div>
+            </div>
+            <div class="msg-meta">
+              <span>📷 客户发送的图片 · ${formatBeijingTime(item.created_at)}</span>
+            </div>
+          </div>`;
+        }
+
         const modeBadge = `<span class="badge ${item.mode_used}">${MODE_META[item.mode_used]?.label || item.mode_used}</span>`;
         const statusBadge = `<span class="badge ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>`;
         const productBadge = `<span class="badge product">📦 ${escapeHtml(productLabel(item.product))}</span>`;

@@ -247,6 +247,9 @@
 
       textarea {
         flex: 1;
+        /* 加了 📷 按钮后输入框左右各有一个按钮，窄屏上必须允许输入框收缩，
+           否则它会被挤到下一行，输入区变成两行、样式错位。 */
+        min-width: 0;
         resize: none;
         min-height: 48px;
         max-height: 140px;
@@ -274,6 +277,28 @@
       button:disabled {
         cursor: not-allowed;
         opacity: 0.55;
+      }
+
+      /* 发送图片按钮：跟发送按钮并排，但用浅色样式区分主次。 */
+      .attach-btn {
+        width: 48px;
+        flex: 0 0 48px;
+        font-size: 20px;
+        background: #f0f4fa;
+        color: #172033;
+        border: 1px solid #d7dfec;
+      }
+
+      .attach-btn:hover:not(:disabled) {
+        border-color: #009c84;
+      }
+
+      /* 聊天气泡里的图片：限制尺寸，点击可在新标签页看原图。 */
+      .message img.chat-image {
+        display: block;
+        max-width: min(220px, 100%);
+        max-height: 220px;
+        border-radius: 10px;
       }
 
       .product-indicator {
@@ -424,6 +449,8 @@
 
         <div class="composer-wrap">
           <form id="form" class="composer">
+            <button id="attach" class="attach-btn" type="button" title="发送图片">📷</button>
+            <input id="image-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" style="display: none" />
             <textarea id="input" placeholder="例如：孕妇能用吗？" rows="1"></textarea>
             <button id="send" type="submit">发送</button>
           </form>
@@ -467,6 +494,8 @@
       const form = document.getElementById("form");
       const input = document.getElementById("input");
       const send = document.getElementById("send");
+      const attachBtn = document.getElementById("attach");
+      const imageInput = document.getElementById("image-input");
       const messages = document.getElementById("messages");
       const pickerOverlay = document.getElementById("product-picker-overlay");
       const pickerOptions = document.getElementById("picker-options");
@@ -498,6 +527,7 @@
       function setComposerEnabled(enabled) {
         input.disabled = !enabled;
         send.disabled = !enabled;
+        attachBtn.disabled = !enabled;
         if (enabled) {
           input.placeholder = "例如：孕妇能用吗？";
         } else {
@@ -711,6 +741,31 @@
         messages.scrollTop = messages.scrollHeight;
         // 落库时同样带上"插在哪条消息后面"，明细表里的顺序才能跟 DOM 里看到的一致。
         recordBubble(el, role, "text", { afterEl });
+        return el;
+      }
+
+      // 图片气泡：气泡里放一张缩略图，点击在新标签页打开原图。落库时 kind=image、
+      // content 存图片 URL，刷新重放时据此原样恢复。
+      function addImageMessage(url, role) {
+        const el = document.createElement("div");
+        el.className = `message ${role}`;
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        const img = document.createElement("img");
+        img.className = "chat-image";
+        img.src = url;
+        img.alt = "图片";
+        img.loading = "lazy";
+        link.appendChild(img);
+        el.appendChild(link);
+        messages.appendChild(el);
+        img.addEventListener("load", () => {
+          messages.scrollTop = messages.scrollHeight;
+        });
+        messages.scrollTop = messages.scrollHeight;
+        recordBubble(el, role, "image", { content: url });
         return el;
       }
 
@@ -1138,6 +1193,14 @@
             }
 
             if (!row.content) return; // 空占位气泡（比如请求出错后没写入内容），跳过
+
+            // 图片气泡：content 存的是图片 URL，恢复成同样的可点击缩略图。
+            if (row.kind === "image") {
+              const el = addImageMessage(row.content, row.role === "user" ? "user" : "bot");
+              el._recordId = Promise.resolve(row.id);
+              return;
+            }
+
             const el = addMessage(row.content, row.role === "user" ? "user" : "bot");
             el._recordId = Promise.resolve(row.id);
           });
@@ -1353,6 +1416,48 @@
           }
         }
       }
+
+      // 发送图片：点相机按钮唤起系统文件选择框（手机上即相册/拍照），选中后先传到服务器
+      // 拿到 URL，再作为一条 kind=image 的气泡显示并落库——客服工作台的对话流里也能看到。
+      attachBtn.addEventListener("click", () => {
+        if (sessionEnded) return;
+        if (!currentProduct) {
+          pickerOverlay.style.display = "flex";
+          return;
+        }
+        imageInput.click();
+      });
+
+      imageInput.addEventListener("change", async () => {
+        const file = imageInput.files && imageInput.files[0];
+        imageInput.value = ""; // 允许连续两次选同一张图也能触发 change
+        if (!file || sessionEnded) return;
+        if (file.size > 5 * 1024 * 1024) {
+          addMessage("图片不能超过 5MB，请压缩后重试～", "bot");
+          return;
+        }
+
+        clearIdleTimer();
+        dismissIdlePromptButtons();
+        attachBtn.disabled = true;
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          const res = await fetch("/api/upload-image", { method: "POST", body: fd });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.url) {
+            throw new Error(data.detail || "上传失败，请稍后重试");
+          }
+          addImageMessage(data.url, "user");
+        } catch (err) {
+          addMessage(`图片发送失败：${err.message}`, "bot");
+        } finally {
+          if (!sessionEnded) {
+            attachBtn.disabled = false;
+          }
+          scheduleIdleEndPrompt();
+        }
+      });
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();

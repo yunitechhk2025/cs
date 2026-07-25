@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -178,6 +187,29 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+
+# 客户上传的图片存到数据目录（Docker volume 持久化），文件名统一用随机 hex，
+# 原始文件名不落盘，也就不存在路径穿越或文件名冲突问题。
+UPLOAD_DIR = database.DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_UPLOAD_NAME_RE = re.compile(r"[a-f0-9]{32}\.(?:jpg|jpeg|png|gif|webp)")
+
+# 客户端聊天气泡的类型白名单（chat_messages.kind）。刷新页面重放历史记录时前端按 kind
+# 决定把气泡渲染成静态文字、可交互表单、图片还是重新接回轮询（见 static/index.html 的
+# restoreHistory）；不在白名单里的一律当普通文字，所以新增气泡类型时必须同步加到这里，
+# 否则该类型落库后会被降级成 text，刷新后就还原不出原来的样子。
+CHAT_MESSAGE_KINDS = (
+    "text",
+    "waiting",
+    "transfer_form",
+    "email_form",
+    "busy_note",
+    "image",
+    "idle_prompt",
+    "session_end",
+)
 
 # 每个有题库的产品各自一个 bot 实例；没有题库的产品不在此字典中出现。
 bots: dict = {}
@@ -919,7 +951,7 @@ def create_chat_message(req: ChatMessageCreateRequest) -> dict:
     跟刷新前看到的完全一致。session_id 是客户浏览器里的私有令牌，安全模型与
     /api/conversations/by-session 一致。"""
     role = req.role if req.role in ("user", "bot") else "bot"
-    kind = req.kind if req.kind in ("text", "waiting", "transfer_form", "email_form", "busy_note") else "text"
+    kind = req.kind if req.kind in CHAT_MESSAGE_KINDS else "text"
     message_id = database.add_chat_message(
         session_id=req.session_id,
         role=role,
@@ -935,7 +967,7 @@ def create_chat_message(req: ChatMessageCreateRequest) -> dict:
 def update_chat_message(message_id: int, req: ChatMessageUpdateRequest) -> dict:
     """更新一条已落库的消息气泡（内容/类型/所属对话）。等待类气泡"先占位、后原地更新"：
     "AI 正在思考…"最终会被答案原地替换，DOM 里同一个气泡对应明细表里同一行。"""
-    kind = req.kind if req.kind in (None, "text", "waiting", "transfer_form", "email_form", "busy_note") else None
+    kind = req.kind if req.kind in CHAT_MESSAGE_KINDS else None
     database.update_chat_message(
         message_id=message_id,
         session_id=req.session_id,
@@ -950,6 +982,38 @@ def update_chat_message(message_id: int, req: ChatMessageUpdateRequest) -> dict:
 def list_chat_messages_by_session(session_id: str) -> dict:
     """客户端刷新页面时拉取本会话的全部消息明细，按显示顺序逐条重放。"""
     return {"items": database.list_chat_messages(session_id)}
+
+
+@app.post("/api/upload-image")
+async def upload_image(file: UploadFile = File(...)) -> dict:
+    """客户在聊天里发送图片：保存到数据目录并返回可访问的 URL。
+    客户端拿到 URL 后自己把图片气泡按 kind=image 落库（走既有的 chat-messages 流程，
+    这样刷新重放、排序都跟普通气泡一套逻辑）。"""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext == ".jpe":
+        ext = ".jpg"
+    if ext not in ALLOWED_IMAGE_EXTS:
+        raise HTTPException(status_code=400, detail="仅支持 jpg / png / gif / webp 格式的图片")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="图片不能超过 5MB，请压缩后重试")
+    name = f"{uuid.uuid4().hex}{ext}"
+    (UPLOAD_DIR / name).write_bytes(data)
+    return {"url": f"/uploads/{name}"}
+
+
+@app.get("/uploads/{filename}")
+def get_uploaded_image(filename: str) -> FileResponse:
+    """按文件名返回客户上传的图片。文件名必须完全匹配"32位hex+扩展名"的生成规则，
+    天然排除路径穿越；不匹配或文件不存在一律 404。"""
+    if not _UPLOAD_NAME_RE.fullmatch(filename):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    path = UPLOAD_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path)
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -1102,8 +1166,21 @@ def agent_sessions(agent: dict = Depends(get_current_agent)) -> dict:
 
 @app.get("/api/agent/sessions/{session_id}")
 def agent_session_messages(session_id: str, agent: dict = Depends(get_current_agent)) -> dict:
-    """某个用户会话下的全部提问/回复，按时间顺序返回，用于渲染连续对话。"""
-    return {"items": database.list_session_messages(session_id)}
+    """某个用户会话下的全部提问/回复，按时间顺序返回，用于渲染连续对话。
+    客户发送的图片没有对应的 conversations 行（AI 不处理图片），单独从聊天明细里取出，
+    按时间插入到问答流中，让客服在同一个对话里看到客户发的图。"""
+    items = [dict(item, item_type="qa") for item in database.list_session_messages(session_id)]
+    images = [
+        {
+            "item_type": "image",
+            "id": f"img-{row['id']}",
+            "image_url": row["content"],
+            "created_at": row["created_at"],
+        }
+        for row in database.list_session_images(session_id)
+    ]
+    merged = sorted(items + images, key=lambda x: x.get("created_at") or "")
+    return {"items": merged}
 
 
 @app.post("/api/agent/answer/{conversation_id}")

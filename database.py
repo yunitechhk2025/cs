@@ -549,3 +549,14 @@ def list_chat_messages(session_id: str) -> list:
             (session_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def list_session_images(session_id: str) -> list:
+    """返回某个会话里客户发送的全部图片气泡（kind=image），供客服工作台在对话流里展示。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, content, role, created_at FROM chat_messages "
+            "WHERE session_id = ? AND kind = 'image' ORDER BY sort_key ASC, id ASC",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]

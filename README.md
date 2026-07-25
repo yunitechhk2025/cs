@@ -81,11 +81,21 @@
 **刷新恢复 = 聊天记录逐条重放（治本机制）**：早期版本的刷新恢复靠 `conversations` 表每条对话的"最终状态"去推演出一份近似的聊天记录，为此陆续打过多个补丁（`awaiting_transfer_details` 记住未提交的转人工表单、`created_at`/`elapsedMs` 续算 10 秒倒计时、`addMessageAfter` 保持提示插入顺序、补画邮箱气泡、`is_explicit_transfer` 区分主动/被动转人工话术），但转人工这类多步流程的过程性消息（引导语、第一次确认、"人工客服正忙"原始提示等）在推演中天然丢失或措辞对不上，刷新后看起来像"换了一个界面"。现在改为逐条落库、逐条重放：
 
 - **落库**：新增 `chat_messages` 明细表（`database.py`），客户端每显示一条消息气泡就调 `POST /api/chat-messages` 记一行，DOM 里的每个气泡对应明细表里的一行；等待类气泡"先占位、后原地更新"（"AI 正在思考…"最终被答案替换时，通过 `POST /api/chat-messages/{id}/update` 原地更新同一行）。`sort_key`（REAL）是排序键：`addMessageAfter` 插入的延迟提示带 `after_id`，服务端取前后两条消息 sort_key 的中间值，保证明细顺序跟 DOM 顺序一致。落库请求在前端通过一个串行 Promise 队列（`recordQueue`）按显示顺序依次发出；单条失败静默忽略，只影响那一条的恢复。
-- **气泡类型（kind）**：`text`（普通文字）/ `waiting`（等待中，同时是这条对话的轮询锚点）/ `transfer_form`（"请描述您的问题"表单）/ `email_form`（"人工客服正忙，留邮箱"表单）/ `busy_note`（已留邮箱场景下的"客服正忙，已邮件通知"提示）。
+- **气泡类型（kind）**：`text`（普通文字）/ `waiting`（等待中，同时是这条对话的轮询锚点）/ `transfer_form`（"请描述您的问题"表单）/ `email_form`（"人工客服正忙，留邮箱"表单）/ `busy_note`（已留邮箱场景下的"客服正忙，已邮件通知"提示）/ `image`（客户发送的图片，`content` 存图片 URL）/ `idle_prompt`（闲置 20 秒后的"是否结束对话"提示，带「继续咨询 / 结束对话」按钮）/ `session_end`（会话已结束）。后端 `web_app.py` 的 `CHAT_MESSAGE_KINDS` 是这份类型的白名单，新增类型必须同步加进去，否则落库时会被降级成 `text`、刷新后还原不出原样。
 - **重放**（`replayChatMessages`）：`GET /api/chat-messages/by-session/{session_id}` 拉明细 + `GET /api/conversations/by-session/{session_id}` 拉对话状态，按顺序逐条渲染。只有两类气泡会复活成可交互状态：① 还没提交的表单（`transfer_form` 且 `awaiting_transfer_details=1`、`email_form` 且未留邮箱未回复）重新渲染成表单；② 还没等到回复的 `waiting` 气泡接回 `pollAnswer`（`elapsedMs` 按真实提问时间续算；明细里已有 `busy_note`/`email_form` 时传 `skipBusy: true` 不再重复补提示；复活的邮箱表单作为 `followUpEl` 传入，最终答案照旧写进那个气泡）。其余一律按静态文字原样展示，重放期间 `recordingEnabled=false`，不会把恢复出来的气泡再记一遍。
 - **老会话兜底**：明细表为空（逐条落库功能上线前就开始的会话）时退回旧的推演式恢复（`restoreHistoryFromConversations`），推演产生的气泡照常落库，之后再刷新就走逐条重放。
 
 无关闲聊/荒谬提问（`_classify_irrelevant` 命中的情况）也会完整落库、正常返回真实的 `conversation_id`，因此刷新页面时同样会出现在恢复的历史记录里，跟其他正常问答一样。
+
+### 客户端发送图片
+
+输入框左侧有一个 📷 按钮，客户点击后唤起系统文件选择框（手机上即相册/拍照），可以把患处照片、包装照片等直接发给客服。
+
+- **上传**：`POST /api/upload-image`（`multipart/form-data`），限 jpg / png / gif / webp、单张不超过 5MB，超限或格式不对返回 400 并在聊天里提示客户。图片存到 `data/uploads/`（与数据库同一个 Docker volume，重启/重新部署不丢），文件名统一用随机 32 位 hex + 原扩展名，原始文件名不落盘。
+- **读取**：`GET /uploads/{filename}`，文件名必须完全匹配"32 位 hex + 允许的扩展名"这个生成规则，不匹配一律 404，因此不存在路径穿越。
+- **展示与恢复**：上传成功后客户端插入一条 `kind=image` 的气泡（缩略图，点击在新标签页看原图）并照常落库，刷新页面时按明细原样重放。
+- **客服工作台**：图片不经过 AI，也不产生 `conversations` 记录，`GET /api/agent/sessions/{session_id}` 会把这些图片按时间插进该会话的问答流里（`item_type=image`），客服在同一个对话框里就能看到客户发的图，图片本身不带回复框。因为会话列表仍由 `conversations` 分组而来，如果客户只发了图、还没提过任何问题，该会话要等他发出第一条文字提问后才会出现在列表里。
+- 依赖：文件上传需要 `python-multipart`（已加入 `requirements.txt`）。
 
 ### 客服工作台：回复框显示规则 / 草稿保存
 

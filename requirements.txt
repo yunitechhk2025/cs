@@ -6,6 +6,7 @@ xlrd
 openai
 fastapi
 uvicorn
+python-multipart
 bcrypt
 pyjwt
 websockets
