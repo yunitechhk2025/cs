@@ -109,6 +109,8 @@ jobs:
             git -C ~/cs log -1 --oneline || true
 
             echo "==> [3/5] docker compose up"
+            docker --version
+            wc -c .env
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
@@ -117,7 +119,16 @@ jobs:
               echo "ERROR: docker compose / docker-compose not found" >&2
               exit 1
             fi
-            $DC up -d --build
+            # 先彻底移除旧容器：历史部署尝试留下的容器对象可能已损坏，
+            # 直接 Recreate 会触发 ResourceExhausted (gRPC message too large)。
+            $DC down --remove-orphans || true
+            docker rm -f cs-demo-chatbot 2>/dev/null || true
+            if ! $DC up -d --build; then
+              echo "WARN: start failed, restarting docker daemon and retrying once"
+              systemctl restart docker || service docker restart
+              sleep 10
+              $DC up -d --build
+            fi
 
             echo "==> [4/5] container status"
             sleep 8
