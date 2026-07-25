@@ -73,6 +73,8 @@ jobs:
           NOTIFY_EMAIL_TO=${NOTIFY_EMAIL_TO:-}
           EOF
           sed -i 's/^[[:space:]]*//' "$GITHUB_WORKSPACE/cs.env"
+          # scp-action 跑在 Docker 里，需要能读到工作区文件；勿用 600
+          chmod 644 "$GITHUB_WORKSPACE/cs.env"
           echo "Prepared cs.env for upload"
 
       - name: Ensure remote directory
