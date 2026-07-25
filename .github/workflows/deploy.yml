@@ -12,12 +12,34 @@ jobs:
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          FAQ_TOP_K: ${{ secrets.FAQ_TOP_K }}
+          FAQ_MIN_SCORE: ${{ secrets.FAQ_MIN_SCORE }}
+          FAQ_EMBED_MODEL: ${{ secrets.FAQ_EMBED_MODEL }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          DEFAULT_MODE: ${{ secrets.DEFAULT_MODE }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
+          SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           password: ${{ secrets.ECS_PASSWORD }}
           port: 22
           script_stop: true
+          # 把上面 env 传进远程 SSH 会话，供生成 .env 使用
+          envs: OPENAI_API_KEY,OPENAI_MODEL,OPENAI_BASE_URL,FAQ_TOP_K,FAQ_MIN_SCORE,FAQ_EMBED_MODEL,APP_PORT,JWT_SECRET,ADMIN_USERNAME,ADMIN_PASSWORD,DEFAULT_MODE,SMTP_HOST,SMTP_PORT,SMTP_USERNAME,SMTP_PASSWORD,SMTP_FROM,SMTP_USE_TLS,SMTP_USE_SSL,NOTIFY_EMAIL_TO
           script: |
             set -e
             # 脱敏版与正式版同机部署：目录 ~/cs，对外端口见 .env 的 APP_PORT（默认 8001）
@@ -30,10 +52,56 @@ jobs:
               git fetch origin main
               git reset --hard origin/main
             fi
-            if [ ! -f .env ]; then
-              echo "ERROR: ~/cs/.env 不存在。请先在服务器上复制 .env.example 为 .env 并填好 OPENAI_API_KEY 等配置。" >&2
-              exit 1
-            fi
+
+            # 用 GitHub Secrets 在服务器上生成 .env（不进 git）
+            python3 <<'PY'
+            import os
+            from pathlib import Path
+
+            def req(name: str) -> str:
+                value = (os.environ.get(name) or "").strip()
+                if not value:
+                    raise SystemExit(
+                        f"ERROR: 缺少 GitHub Secret「{name}」。"
+                        "请到仓库 Settings → Secrets and variables → Actions → Repository secrets 添加。"
+                    )
+                return value
+
+            def opt(name: str, default: str = "") -> str:
+                value = (os.environ.get(name) or "").strip()
+                return value if value else default
+
+            lines = [
+                f"OPENAI_API_KEY={req('OPENAI_API_KEY')}",
+                f"OPENAI_MODEL={opt('OPENAI_MODEL', 'qwen3.6-flash')}",
+                f"OPENAI_BASE_URL={opt('OPENAI_BASE_URL', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1')}",
+                "",
+                f"FAQ_TOP_K={opt('FAQ_TOP_K', '8')}",
+                f"FAQ_MIN_SCORE={opt('FAQ_MIN_SCORE', '0.05')}",
+                f"FAQ_EMBED_MODEL={opt('FAQ_EMBED_MODEL', 'text-embedding-v3')}",
+                f"APP_PORT={opt('APP_PORT', '8001')}",
+                "",
+                f"JWT_SECRET={req('JWT_SECRET')}",
+                f"ADMIN_USERNAME={opt('ADMIN_USERNAME', 'admin')}",
+                f"ADMIN_PASSWORD={req('ADMIN_PASSWORD')}",
+                f"DEFAULT_MODE={opt('DEFAULT_MODE', 'auto')}",
+                "",
+                f"SMTP_HOST={opt('SMTP_HOST')}",
+                f"SMTP_PORT={opt('SMTP_PORT', '587')}",
+                f"SMTP_USERNAME={opt('SMTP_USERNAME')}",
+                f"SMTP_PASSWORD={opt('SMTP_PASSWORD')}",
+                f"SMTP_FROM={opt('SMTP_FROM')}",
+                f"SMTP_USE_TLS={opt('SMTP_USE_TLS', 'true')}",
+                f"SMTP_USE_SSL={opt('SMTP_USE_SSL', 'false')}",
+                f"NOTIFY_EMAIL_TO={opt('NOTIFY_EMAIL_TO')}",
+                "",
+            ]
+            path = Path(".env")
+            path.write_text("\n".join(lines), encoding="utf-8")
+            path.chmod(0o600)
+            print("Wrote ~/cs/.env from GitHub Secrets")
+            PY
+
             mkdir -p data
             docker compose up -d --build
             docker compose ps

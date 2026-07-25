@@ -267,25 +267,31 @@ python excel_rag_chatbot.py --excel "2026.01.26_肤润康-常见咨询问题_v2(
 | 对外端口 | `8000` | `8001`（`.env` 里 `APP_PORT`） |
 | 访问地址 | `http://IP:8000` | `http://IP:8001` |
 
-仓库已包含 `.github/workflows/deploy.yml`。
+仓库已包含 `.github/workflows/deploy.yml`。部署时会用 GitHub Secrets **自动在服务器写入 `~/cs/.env`**，无需 SSH 手动建文件。
 
 在 GitHub → Settings → Secrets and variables → Actions → **Repository secrets** 添加：
+
+**SSH（必填）**
 
 - `ECS_HOST`：服务器公网 IP（可与正式版相同）
 - `ECS_USER`：SSH 用户名（如 `root`）
 - `ECS_PASSWORD`：SSH 密码
 
-**首次部署前**请先 SSH 登录服务器，准备 `.env`（Actions 不会自动创建密钥配置）：
+**应用配置（必填）**
 
-```bash
-mkdir -p ~/cs/data
-cd ~/cs
-# 若目录还是空的，可先手动 clone 一次；之后也可直接靠 Actions 自动 clone
-git clone https://github.com/yunitechhk2025/cs.git .
-cp .env.example .env
-# 编辑 .env：填 OPENAI_API_KEY，确认 APP_PORT=8001，并改掉 JWT_SECRET / ADMIN_PASSWORD
-nano .env
-```
+- `OPENAI_API_KEY`：模型 API Key
+- `JWT_SECRET`：随机字符串（登录鉴权）
+- `ADMIN_PASSWORD`：管理员登录密码
+
+**可选（不填则用括号内默认值）**
+
+- `OPENAI_MODEL`（`qwen3.6-flash`）
+- `OPENAI_BASE_URL`（DashScope 国际兼容地址）
+- `APP_PORT`（`8001`）
+- `ADMIN_USERNAME`（`admin`）
+- `DEFAULT_MODE`（`auto`）
+- `FAQ_TOP_K` / `FAQ_MIN_SCORE` / `FAQ_EMBED_MODEL`
+- `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_USE_TLS` / `SMTP_USE_SSL` / `NOTIFY_EMAIL_TO`（不配则跳过发信）
 
 同时在云安全组放行 **8001** 端口。
 
@@ -293,6 +299,7 @@ nano .env
 
 1. SSH 登录 ECS
 2. 更新 `~/cs` 代码（clone 或 reset 到最新 `main`）
-3. `docker compose up -d --build`（映射到宿主机 `8001`）
+3. 用 Secrets 生成 `~/cs/.env`
+4. `docker compose up -d --build`（映射到宿主机 `8001`）
 
-> `.env` 与 `data/` 不会被 git 覆盖；脱敏版与正式版必须使用各自独立的目录、容器名、端口和数据库卷，避免串数据和抢端口。
+> `.env` 不会进 git；每次部署都会按当前 Secrets 重写。脱敏版与正式版必须使用各自独立的目录、容器名、端口和数据库卷，避免串数据和抢端口。
