@@ -13,7 +13,9 @@ jobs:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         env:
+          # 兼容 OPENAI_API_KEY 或 DASHSCOPE_API_KEY（二选一即可）
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           FAQ_TOP_K: ${{ secrets.FAQ_TOP_K }}
@@ -39,7 +41,7 @@ jobs:
           port: 22
           script_stop: true
           # 把上面 env 传进远程 SSH 会话，供生成 .env 使用
-          envs: OPENAI_API_KEY,OPENAI_MODEL,OPENAI_BASE_URL,FAQ_TOP_K,FAQ_MIN_SCORE,FAQ_EMBED_MODEL,APP_PORT,JWT_SECRET,ADMIN_USERNAME,ADMIN_PASSWORD,DEFAULT_MODE,SMTP_HOST,SMTP_PORT,SMTP_USERNAME,SMTP_PASSWORD,SMTP_FROM,SMTP_USE_TLS,SMTP_USE_SSL,NOTIFY_EMAIL_TO
+          envs: OPENAI_API_KEY,DASHSCOPE_API_KEY,OPENAI_MODEL,OPENAI_BASE_URL,FAQ_TOP_K,FAQ_MIN_SCORE,FAQ_EMBED_MODEL,APP_PORT,JWT_SECRET,ADMIN_USERNAME,ADMIN_PASSWORD,DEFAULT_MODE,SMTP_HOST,SMTP_PORT,SMTP_USERNAME,SMTP_PASSWORD,SMTP_FROM,SMTP_USE_TLS,SMTP_USE_SSL,NOTIFY_EMAIL_TO
           script: |
             set -e
             # 脱敏版与正式版同机部署：目录 ~/cs，对外端口见 .env 的 APP_PORT（默认 8001）
@@ -56,23 +58,45 @@ jobs:
             # 用 GitHub Secrets 在服务器上生成 .env（不进 git）
             python3 <<'PY'
             import os
+            import secrets as pysecrets
             from pathlib import Path
-
-            def req(name: str) -> str:
-                value = (os.environ.get(name) or "").strip()
-                if not value:
-                    raise SystemExit(
-                        f"ERROR: 缺少 GitHub Secret「{name}」。"
-                        "请到仓库 Settings → Secrets and variables → Actions → Repository secrets 添加。"
-                    )
-                return value
 
             def opt(name: str, default: str = "") -> str:
                 value = (os.environ.get(name) or "").strip()
                 return value if value else default
 
+            def read_existing_env(path: Path) -> dict:
+                data = {}
+                if not path.is_file():
+                    return data
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    data[key.strip()] = value.strip()
+                return data
+
+            existing = read_existing_env(Path(".env"))
+
+            api_key = opt("OPENAI_API_KEY") or opt("DASHSCOPE_API_KEY")
+            if not api_key:
+                raise SystemExit(
+                    "ERROR: 缺少 API Key。请在 Repository secrets 中配置 "
+                    "DASHSCOPE_API_KEY 或 OPENAI_API_KEY。"
+                )
+
+            jwt_secret = opt("JWT_SECRET") or existing.get("JWT_SECRET") or pysecrets.token_hex(32)
+            admin_password = (
+                opt("ADMIN_PASSWORD")
+                or existing.get("ADMIN_PASSWORD")
+                or "changeme"
+            )
+            if not opt("ADMIN_PASSWORD") and not existing.get("ADMIN_PASSWORD"):
+                print("WARN: 未配置 ADMIN_PASSWORD，脱敏版默认使用 admin / changeme，请登录后立刻修改。")
+
             lines = [
-                f"OPENAI_API_KEY={req('OPENAI_API_KEY')}",
+                f"OPENAI_API_KEY={api_key}",
                 f"OPENAI_MODEL={opt('OPENAI_MODEL', 'qwen3.6-flash')}",
                 f"OPENAI_BASE_URL={opt('OPENAI_BASE_URL', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1')}",
                 "",
@@ -81,9 +105,9 @@ jobs:
                 f"FAQ_EMBED_MODEL={opt('FAQ_EMBED_MODEL', 'text-embedding-v3')}",
                 f"APP_PORT={opt('APP_PORT', '8001')}",
                 "",
-                f"JWT_SECRET={req('JWT_SECRET')}",
+                f"JWT_SECRET={jwt_secret}",
                 f"ADMIN_USERNAME={opt('ADMIN_USERNAME', 'admin')}",
-                f"ADMIN_PASSWORD={req('ADMIN_PASSWORD')}",
+                f"ADMIN_PASSWORD={admin_password}",
                 f"DEFAULT_MODE={opt('DEFAULT_MODE', 'auto')}",
                 "",
                 f"SMTP_HOST={opt('SMTP_HOST')}",

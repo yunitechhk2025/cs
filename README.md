@@ -277,18 +277,18 @@ python excel_rag_chatbot.py --excel "2026.01.26_肤润康-常见咨询问题_v2(
 - `ECS_USER`：SSH 用户名（如 `root`）
 - `ECS_PASSWORD`：SSH 密码
 
-**应用配置（必填）**
+**应用配置（必填其一）**
 
-- `OPENAI_API_KEY`：模型 API Key
-- `JWT_SECRET`：随机字符串（登录鉴权）
-- `ADMIN_PASSWORD`：管理员登录密码
+- `DASHSCOPE_API_KEY` 或 `OPENAI_API_KEY`：模型 API Key（写进 `.env` 的 `OPENAI_API_KEY`）
 
 **可选（不填则用括号内默认值）**
 
+- `JWT_SECRET`（首次部署自动生成并保留在服务器 `.env`）
+- `ADMIN_PASSWORD`（默认 `changeme`，工作台账号 `admin`，建议登录后修改；也可在 Secrets 里配置）
+- `ADMIN_USERNAME`（`admin`）
 - `OPENAI_MODEL`（`qwen3.6-flash`）
 - `OPENAI_BASE_URL`（DashScope 国际兼容地址）
 - `APP_PORT`（`8001`）
-- `ADMIN_USERNAME`（`admin`）
 - `DEFAULT_MODE`（`auto`）
 - `FAQ_TOP_K` / `FAQ_MIN_SCORE` / `FAQ_EMBED_MODEL`
 - `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_USE_TLS` / `SMTP_USE_SSL` / `NOTIFY_EMAIL_TO`（不配则跳过发信）
