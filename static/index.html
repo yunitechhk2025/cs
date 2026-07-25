@@ -789,10 +789,6 @@
       let products = [];
       let currentProduct = null;
 
-      function getSavedProduct() {
-        return localStorage.getItem(PRODUCT_KEY);
-      }
-
       function productLabel(id) {
         const meta = products.find((p) => p.id === id);
         return meta ? meta.label : id;
@@ -831,12 +827,10 @@
         }
         renderPicker();
 
-        const saved = getSavedProduct();
-        if (saved && products.some((p) => p.id === saved)) {
-          selectProduct(saved, { silent: true });
-        } else {
-          pickerOverlay.style.display = "flex";
-        }
+        // 每次打开/刷新页面都弹出产品选择，不再因为 localStorage 里有上次选择就跳过——
+        // 否则客户第二次进来会直接沿用旧产品，看起来像"只有点切换产品才会弹窗"。
+        // 选过之后仍会写入 localStorage，方便顶部"当前咨询"在选定后正确显示。
+        pickerOverlay.style.display = "flex";
       }
 
       switchProductLink.addEventListener("click", (event) => {
