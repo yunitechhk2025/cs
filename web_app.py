@@ -26,7 +26,7 @@ DEFAULT_EXCEL = "2026.01.26_肤润康-常见咨询问题_v2(1).xls"
 UREA_DOC = "urea_hand_cream_info.md"
 DEFAULT_MODEL = "qwen3.6-flash"
 # 所有邮件通知的主题统一带上品牌名，方便客服在收件箱里一眼认出是哪个客服系统发的。
-BRAND_NAME = "澳洲肤润康"
+BRAND_NAME = "YUNI"
 VALID_MODES = {"auto", "manual", "collab"}
 MODE_LABELS = {"auto": "全AI模式", "manual": "全人工模式", "collab": "人机协同模式"}
 DEFAULT_COLLAB_AUTO_SEND_SECONDS = 5
@@ -45,8 +45,8 @@ DAILY_REPORT_TICK_SECONDS = 30
 #   AI 需要现场组织语言回答，但内容必须严格限定在文档范围内——文档没提到的内容
 #   （如孕妇能否使用等）一律视为未命中，与题库场景未命中时的转人工规则完全一致。
 PRODUCTS: dict = {
-    "azelaic_cream": {"label": "澳洲肤润康 杜鹃花酸乳霜", "excel": DEFAULT_EXCEL},
-    "urea_hand_cream": {"label": "澳洲肤润康 10%尿素护手霜", "doc": UREA_DOC},
+    "azelaic_cream": {"label": "YUNI 杜鹃花酸乳霜", "excel": DEFAULT_EXCEL},
+    "urea_hand_cream": {"label": "YUNI 10%尿素护手霜", "doc": UREA_DOC},
 }
 DEFAULT_PRODUCT = "azelaic_cream"
 NO_KB_TEXT = "亲，这款产品的常见问题库还在整理中，已为您转接人工客服，请稍候~"
@@ -334,8 +334,8 @@ def _is_valid_email(text: str) -> bool:
 def _greeting_reply(product: str) -> str:
     label = PRODUCTS.get(product, {}).get("label", "")
     if label:
-        return f"您好，我是澳洲肤润康「{label}」的 AI 客服，请问有什么想了解的呢？您可以直接告诉我想咨询的问题，我马上为您查询～"
-    return "您好，我是澳洲肤润康 AI 客服，请问有什么想了解的呢？您可以直接告诉我想咨询的问题，我马上为您查询～"
+        return f"您好，我是「{label}」的 AI 客服，请问有什么想了解的呢？您可以直接告诉我想咨询的问题，我马上为您查询～"
+    return f"您好，我是 {BRAND_NAME} AI 客服，请问有什么想了解的呢？您可以直接告诉我想咨询的问题，我马上为您查询～"
 
 
 # 与产品咨询完全无关的闲聊/荒谬提问（"吃饭了吗""这产品对国家安全有危害吗"之类），不应该像

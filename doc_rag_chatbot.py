@@ -216,7 +216,7 @@ class DocRagBot:
     ) -> str:
         context = "\n\n".join(f"【{item.title}】\n{item.text}" for _, item in context_chunks)
         system_prompt = (
-            "你是澳洲肤润康10%碳酰二胺护手乳霜（10%尿素护手霜）的客服助手。\n"
+            "你是 YUNI 10%碳酰二胺护手乳霜（10%尿素护手霜）的客服助手。\n"
             "你只能依据下面提供的《产品资料》回答用户问题，严禁使用产品资料之外的任何知识、常识或推测来补充、"
             "延伸答案，也不能给出医疗诊断、用药调整建议或任何资料未明确提及的健康/安全结论。\n\n"
             f"《产品资料》：\n{context}\n\n"
