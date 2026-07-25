@@ -90,18 +90,15 @@ jobs:
             echo "==> .env exists (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2- || echo '?'))"
 
             echo "==> update code"
-            if [ ! -d .git ]; then
-              TMPDIR=$(mktemp -d)
-              git clone https://github.com/yunitechhk2025/cs.git "$TMPDIR/repo"
-              find "$TMPDIR/repo" -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} ~/cs/ \;
-              cp -a "$TMPDIR/repo/.git" ~/cs/
-              rm -rf "$TMPDIR"
-            else
-              git remote set-url origin https://github.com/yunitechhk2025/cs.git
-              git fetch origin main
-              git reset --hard origin/main
-            fi
-            git log -1 --oneline
+            # 不使用 ~/cs 里历史遗留的 .git：它可能因首次部署中断或属主不同而无法 fetch。
+            # 每次都在临时目录克隆最新 main，再同步应用文件；.env 与 data 保持不动。
+            TMPDIR=$(mktemp -d)
+            trap 'rm -rf "$TMPDIR"' EXIT
+            git clone --depth 1 --branch main https://github.com/yunitechhk2025/cs.git "$TMPDIR/repo"
+            find "$TMPDIR/repo" -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} ~/cs/ \;
+            rm -rf "$TMPDIR"
+            trap - EXIT
+            echo "==> code updated: $(git -C ~/cs log -1 --oneline 2>/dev/null || echo main)"
 
             # 确保 .env 仍在（被 ignore，reset 不会删）
             if [ ! -f .env ]; then
