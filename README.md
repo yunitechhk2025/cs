@@ -267,39 +267,26 @@ python excel_rag_chatbot.py --excel "2026.01.26_肤润康-常见咨询问题_v2(
 | 对外端口 | `8000` | `8001`（`.env` 里 `APP_PORT`） |
 | 访问地址 | `http://IP:8000` | `http://IP:8001` |
 
-仓库已包含 `.github/workflows/deploy.yml`。部署时会用 GitHub Secrets **自动在服务器写入 `~/cs/.env`**，无需 SSH 手动建文件。
+仓库包含两个 Actions 工作流（**密钥不走 SSH envs/base64/scp**，避免传参失败）：
+
+| 工作流 | 何时用 |
+| --- | --- |
+| **Bootstrap server .env**（手动） | 首次、或要更换 API Key 时跑一次，写入服务器 `~/cs/.env` |
+| **Deploy to Aliyun ECS**（push `main` / 手动） | 日常发版：只拉代码 + `docker compose up` |
 
 在 GitHub → Settings → Secrets and variables → Actions → **Repository secrets** 添加：
 
-**SSH（必填）**
+- `ECS_HOST` / `ECS_USER` / `ECS_PASSWORD`：SSH
+- `DASHSCOPE_API_KEY`：模型 API Key（Bootstrap 时写入 `.env` 的 `OPENAI_API_KEY`）
 
-- `ECS_HOST`：服务器公网 IP（可与正式版相同）
-- `ECS_USER`：SSH 用户名（如 `root`）
-- `ECS_PASSWORD`：SSH 密码
+同时在云安全组放行 **8001**。
 
-**应用配置（必填其一）**
+**首次上线顺序：**
 
-- `DASHSCOPE_API_KEY` 或 `OPENAI_API_KEY`：模型 API Key（写进 `.env` 的 `OPENAI_API_KEY`）
+1. Actions → **Bootstrap server .env** → Run workflow  
+2. Actions → **Deploy to Aliyun ECS** → Run workflow  
+3. 打开 `http://IP:8001` ；工作台 `http://IP:8001/agent`（默认 `admin` / `changeme`）
 
-**可选（不填则用括号内默认值）**
+之后改代码 push 到 `main` 只会走 Deploy，不会反复折腾传密钥。
 
-- `JWT_SECRET`（首次部署自动生成并保留在服务器 `.env`）
-- `ADMIN_PASSWORD`（默认 `changeme`，工作台账号 `admin`，建议登录后修改；也可在 Secrets 里配置）
-- `ADMIN_USERNAME`（`admin`）
-- `OPENAI_MODEL`（`qwen3.6-flash`）
-- `OPENAI_BASE_URL`（DashScope 国际兼容地址）
-- `APP_PORT`（`8001`）
-- `DEFAULT_MODE`（`auto`）
-- `FAQ_TOP_K` / `FAQ_MIN_SCORE` / `FAQ_EMBED_MODEL`
-- `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_USE_TLS` / `SMTP_USE_SSL` / `NOTIFY_EMAIL_TO`（不配则跳过发信）
-
-同时在云安全组放行 **8001** 端口。
-
-之后每次 `push` 到 `main`（或手动跑 Actions → Deploy to Aliyun ECS），会自动：
-
-1. SSH 登录 ECS
-2. 更新 `~/cs` 代码（clone 或 reset 到最新 `main`）
-3. 用 Secrets 生成 `~/cs/.env`
-4. `docker compose up -d --build`（映射到宿主机 `8001`）
-
-> `.env` 不会进 git；每次部署都会按当前 Secrets 重写。脱敏版与正式版必须使用各自独立的目录、容器名、端口和数据库卷，避免串数据和抢端口。
+> `.env` 只存在于服务器、不进 git。脱敏版与正式版必须目录/容器名/端口分离，避免串数据和抢端口。

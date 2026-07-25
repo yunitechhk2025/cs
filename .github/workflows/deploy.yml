@@ -1,5 +1,10 @@
 name: Deploy to Aliyun ECS
 
+# 脱敏版部署策略（稳定版）：
+# 1) 用「Bootstrap server .env」工作流（手动）在服务器写入一次 ~/cs/.env
+# 2) 本工作流只负责：拉代码 + docker compose 重建
+# 不再通过 SSH envs / base64 / scp 传密钥，避免传参被截断或转义失败。
+
 on:
   push:
     branches:
@@ -10,79 +15,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Prepare .env (base64)
-        id: prepare_env
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          FAQ_TOP_K: ${{ secrets.FAQ_TOP_K }}
-          FAQ_MIN_SCORE: ${{ secrets.FAQ_MIN_SCORE }}
-          FAQ_EMBED_MODEL: ${{ secrets.FAQ_EMBED_MODEL }}
-          APP_PORT: ${{ secrets.APP_PORT }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-          DEFAULT_MODE: ${{ secrets.DEFAULT_MODE }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
-          SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
-          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
-        run: |
-          set -e
-          API_KEY="${OPENAI_API_KEY:-}"
-          if [ -z "$API_KEY" ]; then
-            API_KEY="${DASHSCOPE_API_KEY:-}"
-          fi
-          if [ -z "$API_KEY" ]; then
-            echo "ERROR: 缺少 API Key。请配置 Repository secret：DASHSCOPE_API_KEY 或 OPENAI_API_KEY"
-            exit 1
-          fi
-
-          JWT_VAL="${JWT_SECRET:-__PRESERVE_OR_GENERATE__}"
-          ADMIN_PW_VAL="${ADMIN_PASSWORD:-__PRESERVE_OR_DEFAULT__}"
-
-          ENV_FILE="$RUNNER_TEMP/cs.env"
-          umask 077
-          cat > "$ENV_FILE" <<EOF
-          OPENAI_API_KEY=${API_KEY}
-          OPENAI_MODEL=${OPENAI_MODEL:-qwen3.6-flash}
-          OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
-
-          FAQ_TOP_K=${FAQ_TOP_K:-8}
-          FAQ_MIN_SCORE=${FAQ_MIN_SCORE:-0.05}
-          FAQ_EMBED_MODEL=${FAQ_EMBED_MODEL:-text-embedding-v3}
-          APP_PORT=${APP_PORT:-8001}
-
-          JWT_SECRET=${JWT_VAL}
-          ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-          ADMIN_PASSWORD=${ADMIN_PW_VAL}
-          DEFAULT_MODE=${DEFAULT_MODE:-auto}
-
-          SMTP_HOST=${SMTP_HOST:-}
-          SMTP_PORT=${SMTP_PORT:-587}
-          SMTP_USERNAME=${SMTP_USERNAME:-}
-          SMTP_PASSWORD=${SMTP_PASSWORD:-}
-          SMTP_FROM=${SMTP_FROM:-}
-          SMTP_USE_TLS=${SMTP_USE_TLS:-true}
-          SMTP_USE_SSL=${SMTP_USE_SSL:-false}
-          NOTIFY_EMAIL_TO=${NOTIFY_EMAIL_TO:-}
-          EOF
-          sed -i 's/^[[:space:]]*//' "$ENV_FILE"
-
-          B64=$(base64 -w0 "$ENV_FILE")
-          echo "env_b64=${B64}" >> "$GITHUB_OUTPUT"
-          echo "Prepared .env as base64 (${#B64} chars)"
-
-      - name: Deploy over SSH
+      - name: Deploy code over SSH
         uses: appleboy/ssh-action@v1.2.0
-        env:
-          ENV_B64: ${{ steps.prepare_env.outputs.env_b64 }}
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
@@ -90,7 +24,6 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 30m
-          envs: ENV_B64
           script: |
             set -e
             echo "==> prepare ~/cs"
@@ -98,42 +31,12 @@ jobs:
             cd ~/cs
             pwd
 
-            if [ -z "${ENV_B64:-}" ]; then
-              echo "ERROR: ENV_B64 is empty (Actions output not passed)" >&2
+            if [ ! -f .env ]; then
+              echo "ERROR: ~/cs/.env 不存在。" >&2
+              echo "请先到 Actions 手动运行一次「Bootstrap server .env」，或 SSH 自行创建 .env。" >&2
               exit 1
             fi
-
-            echo "==> decode .env"
-            OLD_JWT=""
-            OLD_ADMIN_PW=""
-            if [ -f .env ]; then
-              OLD_JWT=$(grep -E '^JWT_SECRET=' .env | head -n1 | cut -d= -f2- || true)
-              OLD_ADMIN_PW=$(grep -E '^ADMIN_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)
-            fi
-
-            echo "$ENV_B64" | base64 -d > .env
-            chmod 600 .env
-
-            if grep -q '^JWT_SECRET=__PRESERVE_OR_GENERATE__$' .env; then
-              if [ -n "$OLD_JWT" ]; then
-                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${OLD_JWT}|" .env
-              else
-                NEW_JWT=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
-                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${NEW_JWT}|" .env
-                echo "==> generated new JWT_SECRET"
-              fi
-            fi
-
-            if grep -q '^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$' .env; then
-              if [ -n "$OLD_ADMIN_PW" ] && [ "$OLD_ADMIN_PW" != "__PRESERVE_OR_DEFAULT__" ]; then
-                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=${OLD_ADMIN_PW}|" .env
-              else
-                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=changeme|" .env
-                echo "WARN: using default admin/changeme"
-              fi
-            fi
-
-            echo "==> .env ready (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2-))"
+            echo "==> .env exists (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2- || echo '?'))"
 
             echo "==> update code"
             if [ ! -d .git ]; then
@@ -149,6 +52,7 @@ jobs:
             fi
             git log -1 --oneline
 
+            # 确保 .env 仍在（被 ignore，reset 不会删）
             if [ ! -f .env ]; then
               echo "ERROR: .env missing after code update" >&2
               exit 1

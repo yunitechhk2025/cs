@@ -1,0 +1,90 @@
+name: Bootstrap server .env
+
+# 手动运行一次：把 Repository Secrets 写进服务器 ~/cs/.env
+# 写法：由 GitHub Actions 在发送脚本前替换 ${{ secrets.* }}，
+# 不走 SSH envs / base64 / scp，避免传参失败。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write .env on server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          script_stop: true
+          script: |
+            set -e
+            echo "==> prepare ~/cs"
+            mkdir -p ~/cs/data
+            cd ~/cs
+
+            OLD_JWT=""
+            OLD_ADMIN_PW=""
+            if [ -f .env ]; then
+              OLD_JWT=$(grep -E '^JWT_SECRET=' .env | head -n1 | cut -d= -f2- || true)
+              OLD_ADMIN_PW=$(grep -E '^ADMIN_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)
+              echo "==> found existing .env, will preserve JWT/ADMIN_PASSWORD when possible"
+            fi
+
+            # 下面的 ${{ }} 在 GitHub 端已替换成真实值后再发给服务器。
+            # 使用单引号 heredoc，避免密钥里的 $ 被远程 shell 再展开。
+            cat > .env <<'EOF'
+            OPENAI_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}
+            OPENAI_MODEL=qwen3.6-flash
+            OPENAI_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+            FAQ_TOP_K=8
+            FAQ_MIN_SCORE=0.05
+            FAQ_EMBED_MODEL=text-embedding-v3
+            APP_PORT=8001
+
+            JWT_SECRET=__PRESERVE_OR_GENERATE__
+            ADMIN_USERNAME=admin
+            ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__
+            DEFAULT_MODE=auto
+
+            SMTP_HOST=
+            SMTP_PORT=587
+            SMTP_USERNAME=
+            SMTP_PASSWORD=
+            SMTP_FROM=
+            SMTP_USE_TLS=true
+            SMTP_USE_SSL=false
+            NOTIFY_EMAIL_TO=
+            EOF
+            sed -i 's/^[[:space:]]*//' .env
+            chmod 600 .env
+
+            if [ -z "$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)" ]; then
+              echo "ERROR: DASHSCOPE_API_KEY secret 为空，请先在仓库 Repository secrets 里配置。" >&2
+              exit 1
+            fi
+
+            if grep -q '^JWT_SECRET=__PRESERVE_OR_GENERATE__$' .env; then
+              if [ -n "$OLD_JWT" ]; then
+                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${OLD_JWT}|" .env
+              else
+                NEW_JWT=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
+                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${NEW_JWT}|" .env
+                echo "==> generated JWT_SECRET"
+              fi
+            fi
+
+            if grep -q '^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$' .env; then
+              if [ -n "$OLD_ADMIN_PW" ] && [ "$OLD_ADMIN_PW" != "__PRESERVE_OR_DEFAULT__" ]; then
+                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=${OLD_ADMIN_PW}|" .env
+              else
+                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=changeme|" .env
+                echo "WARN: admin password defaulted to changeme"
+              fi
+            fi
+
+            echo "==> ~/cs/.env written OK (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2-))"
+            echo "==> next: run workflow「Deploy to Aliyun ECS」"
