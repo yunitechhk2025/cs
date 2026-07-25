@@ -12,7 +12,58 @@ on:
   workflow_dispatch:
 
 jobs:
+  bootstrap_env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create server .env from repository secrets
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          script_stop: true
+          script: |
+            set -e
+            echo "==> write ~/cs/.env"
+            mkdir -p ~/cs/data
+            cd ~/cs
+            cat > .env <<'EOF'
+            OPENAI_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}
+            OPENAI_MODEL=qwen3.6-flash
+            OPENAI_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+            FAQ_TOP_K=8
+            FAQ_MIN_SCORE=0.05
+            FAQ_EMBED_MODEL=text-embedding-v3
+            APP_PORT=8001
+
+            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            ADMIN_USERNAME=admin
+            ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            DEFAULT_MODE=auto
+            EOF
+            sed -i 's/^[[:space:]]*//' .env
+
+            if [ -z "$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)" ]; then
+              echo "ERROR: Repository secret DASHSCOPE_API_KEY is empty or missing." >&2
+              exit 1
+            fi
+
+            # 可选的 JWT / 管理员密码未配置时，为脱敏演示版提供安全可运行的默认值。
+            if [ -z "$(grep -E '^JWT_SECRET=' .env | cut -d= -f2-)" ]; then
+              sed -i "s|^JWT_SECRET=$|JWT_SECRET=$(cat /proc/sys/kernel/random/uuid | tr -d '-')|" .env
+              echo "==> generated JWT_SECRET"
+            fi
+            if [ -z "$(grep -E '^ADMIN_PASSWORD=' .env | cut -d= -f2-)" ]; then
+              sed -i 's|^ADMIN_PASSWORD=$|ADMIN_PASSWORD=changeme|' .env
+              echo "WARN: using default administrator password; change it after login."
+            fi
+            chmod 600 .env
+            echo "==> .env ready"
+
   deploy:
+    needs: bootstrap_env
     runs-on: ubuntu-latest
     steps:
       - name: Deploy code over SSH
