@@ -200,6 +200,32 @@
         margin-top: 10px;
       }
 
+      /* 闲置超时后，客服主动提示是否结束对话时的操作按钮。 */
+      .idle-end-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+
+      .idle-end-actions button {
+        width: auto;
+        padding: 8px 16px;
+        border-radius: 10px;
+        font-size: 14px;
+      }
+
+      .idle-end-actions .idle-end-continue {
+        background: #ffffff;
+        color: #009c84;
+        border: 1.5px solid #009c84;
+      }
+
+      .idle-end-actions .idle-end-confirm {
+        background: #009c84;
+        color: #ffffff;
+      }
+
       .composer-wrap {
         border-top: 1px solid #e8edf5;
         background: #ffffff;
@@ -450,6 +476,141 @@
 
       // 留邮箱 / 补充问题这两个入口共用同一套邮箱格式校验，只有真实格式的邮箱才会被接受。
       const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+      // 一轮问答结束后若 20 秒内没有新对话，客服主动提示是否结束本次会话。
+      const IDLE_END_MS = 20000;
+      const IDLE_PROMPT_TEXT = "您好，看您暂时没有其他问题，请问是否结束本次对话？";
+      const SESSION_END_TEXT = "好的，本次对话已结束。如需再次咨询，刷新页面即可重新开始～感谢您的咨询！";
+      let idleTimer = null;
+      let idlePromptEl = null;
+      let sessionEnded = false;
+      let activeWaits = 0;
+      let openForms = 0;
+      let hasCompletedExchange = false;
+
+      function clearIdleTimer() {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+      }
+
+      function setComposerEnabled(enabled) {
+        input.disabled = !enabled;
+        send.disabled = !enabled;
+        if (enabled) {
+          input.placeholder = "例如：孕妇能用吗？";
+        } else {
+          input.placeholder = "本次对话已结束";
+          input.blur();
+        }
+      }
+
+      function dismissIdlePromptButtons() {
+        if (!idlePromptEl) return;
+        const actions = idlePromptEl.querySelector(".idle-end-actions");
+        if (actions) actions.remove();
+        updateBubbleRecord(idlePromptEl, { kind: "text", content: IDLE_PROMPT_TEXT });
+        idlePromptEl = null;
+      }
+
+      function pauseIdleForForm() {
+        clearIdleTimer();
+        openForms += 1;
+      }
+
+      function resumeIdleAfterForm() {
+        openForms = Math.max(0, openForms - 1);
+      }
+
+      function scheduleIdleEndPrompt() {
+        clearIdleTimer();
+        if (sessionEnded || idlePromptEl || activeWaits > 0 || openForms > 0 || !hasCompletedExchange) {
+          return;
+        }
+        idleTimer = setTimeout(showIdleEndPrompt, IDLE_END_MS);
+      }
+
+      // alreadyRecorded=true：刷新重放时气泡已在明细里，只挂按钮、不再落库。
+      function renderIdleEndPrompt(el, alreadyRecorded) {
+        el.innerHTML = "";
+
+        const textEl = document.createElement("div");
+        textEl.textContent = IDLE_PROMPT_TEXT;
+        el.appendChild(textEl);
+
+        const actions = document.createElement("div");
+        actions.className = "idle-end-actions";
+
+        const continueBtn = document.createElement("button");
+        continueBtn.type = "button";
+        continueBtn.className = "idle-end-continue";
+        continueBtn.textContent = "继续咨询";
+
+        const endBtn = document.createElement("button");
+        endBtn.type = "button";
+        endBtn.className = "idle-end-confirm";
+        endBtn.textContent = "结束对话";
+
+        actions.appendChild(continueBtn);
+        actions.appendChild(endBtn);
+        el.appendChild(actions);
+        messages.scrollTop = messages.scrollHeight;
+
+        if (!alreadyRecorded) {
+          recordBubble(el, "bot", "idle_prompt", { content: IDLE_PROMPT_TEXT });
+        }
+        idlePromptEl = el;
+
+        continueBtn.addEventListener("click", () => {
+          if (sessionEnded) return;
+          dismissIdlePromptButtons();
+          scheduleIdleEndPrompt();
+          input.focus();
+        });
+
+        endBtn.addEventListener("click", () => {
+          endConversation();
+        });
+      }
+
+      function showIdleEndPrompt() {
+        idleTimer = null;
+        if (sessionEnded || activeWaits > 0 || openForms > 0 || idlePromptEl) return;
+
+        const el = document.createElement("div");
+        el.className = "message bot";
+        messages.appendChild(el);
+        renderIdleEndPrompt(el, false);
+      }
+
+      function endConversation() {
+        if (sessionEnded) return;
+        sessionEnded = true;
+        clearIdleTimer();
+        dismissIdlePromptButtons();
+        const el = addMessage(SESSION_END_TEXT, "bot");
+        updateBubbleRecord(el, { kind: "session_end", content: SESSION_END_TEXT });
+        setComposerEnabled(false);
+      }
+
+      function noteExchangeCompleted() {
+        hasCompletedExchange = true;
+        scheduleIdleEndPrompt();
+      }
+
+      function beginWait() {
+        clearIdleTimer();
+        dismissIdlePromptButtons();
+        activeWaits += 1;
+      }
+
+      function endWait() {
+        activeWaits = Math.max(0, activeWaits - 1);
+        if (activeWaits === 0) {
+          noteExchangeCompleted();
+        }
+      }
 
       // 用 sessionStorage（不是 localStorage）保存会话 id：sessionStorage 只在"当前标签页"存在，
       // 刷新页面（F5）不会清空，正好可以借它的这段生命周期恢复聊天记录；但客户把标签页叉掉/
@@ -735,6 +896,7 @@
               submitBtn.remove();
             }
             statusEl.remove();
+            resumeIdleAfterForm();
 
             // 客户填的问题单独成一条正常大小的消息保留下来，不再挤在上面那句
             // "好的，请您简单描述…"提示下面变成一行不起眼的小字。
@@ -745,6 +907,7 @@
             // 不展示邮箱气泡、不发邮件通知客服，整个转人工流程终止。
             if (data && data.irrelevant) {
               addMessage(data.answer || "这个问题好像和产品咨询没有太大关系呢。", "bot");
+              noteExchangeCompleted();
               return;
             }
 
@@ -918,8 +1081,33 @@
             // 提交过了就只剩那句引导语，按静态文字展示。
             if (row.kind === "transfer_form" && conv && conv.awaiting_transfer_details) {
               const el = addMessage("", "bot");
+              pauseIdleForForm();
               renderTransferQuestionPrompt(el, conv.id, conv.mode_used === "manual", conv.mode_used);
               el._recordId = Promise.resolve(row.id);
+              return;
+            }
+
+            // 闲置结束提示：刷新后若会话尚未结束，重新挂上「继续咨询 / 结束对话」按钮。
+            if (row.kind === "idle_prompt") {
+              const el = addMessage("", "bot");
+              el._recordId = Promise.resolve(row.id);
+              const laterEnded = msgItems.some(
+                (other) => other.kind === "session_end" && other.id > row.id
+              );
+              if (!sessionEnded && !laterEnded) {
+                renderIdleEndPrompt(el, true);
+              } else {
+                setFinalText(el, row.content || IDLE_PROMPT_TEXT);
+              }
+              return;
+            }
+
+            // 会话已主动结束：锁定输入框，不再启动闲置计时。
+            if (row.kind === "session_end") {
+              const el = addMessage(row.content || SESSION_END_TEXT, "bot");
+              el._recordId = Promise.resolve(row.id);
+              sessionEnded = true;
+              setComposerEnabled(false);
               return;
             }
 
@@ -971,6 +1159,15 @@
             followUpEl: emailFormElByConv[conv.id] || null,
           }).catch(() => {});
         });
+
+        // 刷新后若已有完整问答、当前也没有在等回复/填表/已结束，则重新启动 20 秒闲置计时。
+        const hasAnswered = convItems.some((c) => c.status === "answered");
+        if (hasAnswered && !sessionEnded && !idlePromptEl) {
+          hasCompletedExchange = true;
+          if (Object.keys(waitingElByConv).length === 0 && openForms === 0) {
+            scheduleIdleEndPrompt();
+          }
+        }
       }
 
       // 旧版"推演式"恢复，仅作为明细表为空（功能上线前的老会话）时的兜底保留。
@@ -986,6 +1183,7 @@
             }
             if (item.status === "answered") {
               addMessage(item.answer || "", "bot");
+              hasCompletedExchange = true;
               return;
             }
             // 客户当时说了"转人工"之类，但还没来得及提交"具体想咨询的问题"这个补充表单
@@ -995,6 +1193,7 @@
             // 流程走完，跟第一次遇到时看到的一模一样。
             if (item.awaiting_transfer_details) {
               const bubble = addMessage("", "bot");
+              pauseIdleForForm();
               renderTransferQuestionPrompt(bubble, item.id, item.mode_used === "manual", item.mode_used);
               return;
             }
@@ -1027,6 +1226,9 @@
               elapsedMs: elapsedMsSince(item.created_at),
             }).catch(() => {});
           });
+          if (hasCompletedExchange && !sessionEnded && activeWaits === 0 && openForms === 0) {
+            scheduleIdleEndPrompt();
+          }
         } catch (err) {
           // 拉取历史失败时静默忽略，不影响客户继续正常提问
         }
@@ -1071,6 +1273,7 @@
         const elapsedMs = Math.max(0, options.elapsedMs || 0);
         const remainingMs = Math.max(0, 10000 - elapsedMs);
         let answered = false;
+        beginWait();
         // 未命中题库、真正转人工时，"人工客服正忙"提示会作为新的一条消息追加在下面，
         // 不会覆盖掉前面"已收到您的问题，正在为您转接人工客服，请稍候"这条消息——
         // 两条都要保留在对话记录里，followUpEl 记录新增的那一条，方便最终答案写入。
@@ -1142,6 +1345,7 @@
               // 拿到最终回复后这个气泡就是一条普通文字消息了（哪怕它之前是留邮箱的表单），
               // 明细里也改回 text，刷新重放时直接按静态文字渲染。
               updateBubbleRecord(targetEl, { kind: "text", conversation_id: conversationId });
+              endWait();
               return;
             }
           } catch (err) {
@@ -1152,12 +1356,16 @@
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
+        if (sessionEnded) return;
         const text = input.value.trim();
         if (!text) return;
         if (!currentProduct) {
           pickerOverlay.style.display = "flex";
           return;
         }
+
+        clearIdleTimer();
+        dismissIdlePromptButtons();
 
         input.value = "";
         addMessage(text, "user");
@@ -1174,11 +1382,14 @@
           if (data.status === "answered") {
             setFinalText(loading, data.answer);
             updateBubbleRecord(loading, { kind: "text", conversation_id: data.conversation_id });
+            noteExchangeCompleted();
           } else if (data.need_transfer_details) {
             // 客户直接说了"转人工"之类，明确要求转接真人：不用再演"AI 思考/等待"这段过程，
             // 直接请客户补充具体问题（全人工模式下不需要再选填邮箱）。这里先不轮询——客户还
             // 没提交真正想问的问题，提交之后才会在 renderTransferQuestionPrompt 里另起一条
             // 新消息并开始轮询，避免两边同时轮询同一个对话、互相抢着改同一条消息内容。
+            // 补充表单打开期间暂停闲置计时，避免 20 秒提示打断填表。
+            pauseIdleForForm();
             renderTransferQuestionPrompt(loading, data.conversation_id, data.mode === "manual", data.mode);
           } else {
             // 人机协同模式下，若题库已命中（AI 已生成建议、进入自动发送倒计时），
@@ -1195,9 +1406,12 @@
           }
         } catch (err) {
           setFinalText(loading, `出错了：${err.message}`);
+          noteExchangeCompleted();
         } finally {
-          send.disabled = false;
-          input.focus();
+          if (!sessionEnded) {
+            send.disabled = false;
+            input.focus();
+          }
         }
       });
 
