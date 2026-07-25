@@ -86,6 +86,20 @@ def init_db() -> None:
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            -- 客户在聊天里发送的图片：上传时就调视觉模型把图片内容转成一段文字描述存在这里，
+            -- 等客户接着提问时再把这段描述并进问题一起走正常的题库检索/回答流程（见 web_app.py
+            -- 的 /api/ask）。consumed 标记这张图片是否已经被某次提问"用掉"了，避免同一张图片
+            -- 反复并进后面每一个问题里。
+            CREATE TABLE IF NOT EXISTS pending_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                consumed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_images_session ON pending_images(session_id, consumed);
             CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
             CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, sort_key);
@@ -116,6 +130,10 @@ def init_db() -> None:
         # 客服"而不是"已收到您的问题，正在为您转接人工客服"），否则刷新后会显示成一句跟当时
         # 实际发生的事情不符的话，看起来像是"变成另一个界面"。
         _add_column_if_missing(conn, "conversations", "is_explicit_transfer", "INTEGER DEFAULT 0")
+        # 这条提问是否附带了客户发来的图片：image_description 是视觉模型给出的图片文字描述
+        # （已并进本次提问一起检索），客服在工作台能看到 AI 到底"看见了什么"，便于复核。
+        _add_column_if_missing(conn, "conversations", "image_url", "TEXT")
+        _add_column_if_missing(conn, "conversations", "image_description", "TEXT")
 
         row = conn.execute("SELECT value FROM settings WHERE key = 'global_mode'").fetchone()
         if row is None:
@@ -552,11 +570,68 @@ def list_chat_messages(session_id: str) -> list:
 
 
 def list_session_images(session_id: str) -> list:
-    """返回某个会话里客户发送的全部图片气泡（kind=image），供客服工作台在对话流里展示。"""
+    """返回某个会话里客户发送的全部图片气泡（kind=image），供客服工作台在对话流里展示。
+    顺带带上视觉模型给出的文字描述（按图片 URL 关联 pending_images），让客服直接看到
+    AI 是怎么理解这张图的。"""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, content, role, created_at FROM chat_messages "
-            "WHERE session_id = ? AND kind = 'image' ORDER BY sort_key ASC, id ASC",
+            """
+            SELECT m.id, m.content, m.role, m.created_at,
+                   (SELECT p.description FROM pending_images p
+                    WHERE p.session_id = m.session_id AND p.url = m.content
+                    ORDER BY p.id DESC LIMIT 1) AS description
+            FROM chat_messages m
+            WHERE m.session_id = ? AND m.kind = 'image'
+            ORDER BY m.sort_key ASC, m.id ASC
+            """,
             (session_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------- 客户发送的图片（视觉模型描述 + 与下一次提问合并） ----------------
+
+
+def add_pending_image(session_id: str, url: str, description: str) -> int:
+    """记录一张客户刚发来的图片及其视觉模型文字描述，等待与客户接下来的提问合并。"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO pending_images (session_id, url, description) VALUES (?, ?, ?)",
+            (session_id, url, description),
+        )
+        return cur.lastrowid
+
+
+def take_pending_images(session_id: str, max_age_seconds: int = 600) -> list:
+    """取出该会话尚未被任何提问用掉、且还没过期的图片描述，并原子地标记为已消费。
+    客户"先发图、再打字提问"是两个独立请求，服务端只能靠这张暂存表把两者接起来；
+    标记消费是为了避免同一张图片被并进之后的每一个问题里（客户问第二个不相关的问题时，
+    还带着上一张图的描述会把检索带偏）。超过 max_age_seconds 的图片视为客户已经不打算
+    就它提问了，直接忽略（仍留在表里，供工作台展示描述）。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, description FROM pending_images
+            WHERE session_id = ? AND consumed = 0
+              AND created_at >= datetime('now', ?)
+            ORDER BY id ASC
+            """,
+            (session_id, f"-{int(max_age_seconds)} seconds"),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        if items:
+            placeholders = ",".join("?" for _ in items)
+            conn.execute(
+                f"UPDATE pending_images SET consumed = 1 WHERE id IN ({placeholders})",
+                [item["id"] for item in items],
+            )
+        return items
+
+
+def set_conversation_image(conversation_id: int, image_url: str, image_description: str) -> None:
+    """记下这条提问附带的客户图片及其文字描述（描述已并进本次提问一起检索）。"""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE conversations SET image_url = ?, image_description = ? WHERE id = ?",
+            (image_url, image_description, conversation_id),
+        )

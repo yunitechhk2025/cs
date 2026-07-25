@@ -524,6 +524,20 @@
         border-radius: 8px;
       }
 
+      /* 视觉模型对客户图片的文字描述（客户后续提问会带着它一起检索）。 */
+      .image-desc {
+        margin: 6px 0 0 44px;
+        padding: 8px 12px;
+        max-width: 62%;
+        background: #f3eef9;
+        border-left: 3px solid #8b5cbf;
+        border-radius: 8px;
+        font-size: 13px;
+        line-height: 1.6;
+        color: #4b3a6b;
+        word-break: break-word;
+      }
+
       .bubble-block {
         margin-bottom: 14px;
       }
@@ -1781,12 +1795,18 @@
         // 插入到问答流中（item_type=image），这里渲染成一个只有图片气泡的块，不带回复框。
         if (item.item_type === "image") {
           const url = escapeHtml(item.image_url || "");
+          // 视觉模型对这张图的文字描述：客户接下来的提问会自动带上它一起检索，
+          // 这里展示出来，客服可以核对 AI 到底"看见了什么"。
+          const descHtml = item.image_description
+            ? `<div class="image-desc">🔍 AI 识别：${escapeHtml(item.image_description)}</div>`
+            : "";
           return `
           <div class="bubble-block">
             <div class="bubble-row customer">
               <div class="bubble-avatar customer" title="客户">🧑</div>
               <div class="bubble customer"><a href="${url}" target="_blank" rel="noopener"><img class="chat-image" src="${url}" alt="客户发送的图片" loading="lazy" /></a></div>
             </div>
+            ${descHtml}
             <div class="msg-meta">
               <span>📷 客户发送的图片 · ${formatBeijingTime(item.created_at)}</span>
             </div>
@@ -1808,12 +1828,19 @@
           badgesHtml
         );
 
+        // 这条提问是连着客户刚发的图片一起处理的：题库检索/AI 回答用的是"客户原话 + 图片
+        // 文字描述"，这里把描述展示出来，否则客服只看到一句"这个正常吗"会看不懂 AI 凭什么这么答。
+        const imageNoteHtml = item.image_description
+          ? `<div class="image-desc">📷 本次提问附带客户图片，AI 识别：${escapeHtml(item.image_description)}</div>`
+          : "";
+
         let html = `
           <div class="bubble-block" data-msg-id="${item.id}">
             <div class="bubble-row customer">
               <div class="bubble-avatar customer" title="客户">🧑</div>
               <div class="bubble customer">${escapeHtml(item.question)}</div>
             </div>
+            ${imageNoteHtml}
             ${intentHtml || `<div class="msg-badges">${badgesHtml}</div>`}
             <div class="msg-meta">
               <span>#${item.id} · ${formatBeijingTime(item.created_at)}</span>

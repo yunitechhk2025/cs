@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     Request,
     UploadFile,
@@ -195,6 +197,34 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _UPLOAD_NAME_RE = re.compile(r"[a-f0-9]{32}\.(?:jpg|jpeg|png|gif|webp)")
+_IMAGE_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# 客户发来的图片先由视觉模型转成一段文字描述，再跟客户的文字问题合并成一个问题，交给
+# 原有的题库检索/回答流程处理——AI 始终只能照题库答，不会因为"看到了图"就自由发挥。
+# 默认用 qwen3-vl-flash（阿里百炼上最便宜的视觉模型，做"描述图片"够用）；若该模型在你的
+# 账号/地域不可用，把 VISION_MODEL 换成 qwen3.6-flash（本身也支持图像）即可。
+DEFAULT_VISION_MODEL = "qwen3-vl-flash"
+# 图片描述只用于喂给检索/回答，不直接展示给客户，所以要求客观、简短、不做任何诊断或建议。
+VISION_SYSTEM_PROMPT = (
+    "你是客服系统里的图片识别助手。客户在咨询护肤产品时发来一张图片，请只客观描述图片里"
+    "实际能看到的内容，供后续的客服流程参考。\n"
+    "要求：\n"
+    "1. 只描述看得见的事实：皮肤问题的部位、颜色、范围、形态；产品包装上的名称、规格、"
+    "生产日期、批号等文字；截图里的文字内容等。\n"
+    "2. 绝对不要做医学判断、不要猜测病因、不要给任何用药或护理建议、不要安慰或寒暄。\n"
+    "3. 如果图片与护肤品、皮肤状况、产品包装都无关，直接说明图片里是什么即可。\n"
+    "4. 用一段中文陈述，100 字以内，不要分点，不要加任何前缀。"
+)
+# 图片描述与提问的合并窗口：客户"先发图、再打字"是两个独立请求，这段时间内的下一次提问
+# 会自动带上图片描述。设成 10 分钟而不是 10 秒，是因为客户只发图不说话时，客服机器人会在
+# 10 秒后主动追问"想咨询这张图的什么问题"，客户回答这句追问时图片必须还有效。
+PENDING_IMAGE_MAX_AGE_SECONDS = 600
 
 # 客户端聊天气泡的类型白名单（chat_messages.kind）。刷新页面重放历史记录时前端按 kind
 # 决定把气泡渲染成静态文字、可交互表单、图片还是重新接回轮询（见 static/index.html 的
@@ -444,6 +474,59 @@ def _irrelevant_reply(product: str) -> str:
 
 def _ai_model(model: Optional[str]) -> str:
     return model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+
+
+def _vision_model() -> str:
+    return os.getenv("VISION_MODEL", DEFAULT_VISION_MODEL)
+
+
+def _describe_image(path: Path) -> str:
+    """调视觉模型把客户发来的图片转成一段客观的文字描述。返回空字符串表示识别失败
+    （没配 API Key、模型不支持图片、网络异常等）——调用方要能在没有描述的情况下照常工作，
+    图片识别只是"锦上添花"，不能因为它挂了就让客户连图都发不出去。"""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv("OPENAI_BASE_URL"),
+            timeout=40.0,
+            max_retries=1,
+        )
+        mime = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
+        data_url = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        resp = client.chat.completions.create(
+            model=_vision_model(),
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": "请描述这张图片的内容。"},
+                    ],
+                },
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip()[:500]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 图片识别失败（将按无描述处理）: {exc}", file=sys.stderr)
+        return ""
+
+
+def _merge_image_into_question(question: str, descriptions: list) -> str:
+    """把图片的文字描述并进客户的文字问题，合成一个交给题库检索/AI 回答的完整问题。
+    客户常常是"发一张图 + 一句「这个正常吗」"，单看文字什么信息都没有、必然检索不中；
+    带上图片描述之后，"手背发红脱皮"这类内容才能匹配到题库里对应的问题。"""
+    parts = [desc for desc in descriptions if desc]
+    if not parts:
+        return question
+    joined = "；".join(parts)
+    return f"{question}\n【客户同时发来图片，图片内容】{joined}"
 
 
 def _generate_ai_reply(product: str, question: str, model: Optional[str]) -> AnswerResult:
@@ -803,13 +886,33 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
     conversation_id = database.create_conversation(session_id, question, mode, _client_ip(request), product)
 
+    # 客户刚发来、还没被任何提问用掉的图片：把视觉模型给出的文字描述并进本次提问，作为
+    # 一个完整问题走后面正常的检索/回答流程。conversations.question 仍然只存客户自己打的
+    # 文字（工作台里客户气泡要显示客户的原话），图片描述单独存一列给客服复核。
+    pending_images = database.take_pending_images(session_id, PENDING_IMAGE_MAX_AGE_SECONDS)
+    image_descriptions = [item["description"] for item in pending_images if item["description"]]
+    has_image = bool(pending_images)
+    if pending_images:
+        database.set_conversation_image(
+            conversation_id, pending_images[-1]["url"], "；".join(image_descriptions)
+        )
+    # 后续检索/AI 判断统一用这个合并后的问题；打招呼、转人工这类"看客户原话"的判断仍用原文。
+    query = _merge_image_into_question(question, image_descriptions)
+
     # 与产品咨询完全无关的闲聊/荒谬提问（"吃饭了吗""这产品对国家安全有危害吗"之类）：不进人工
     # 队列、不发邮件提醒，只在客户端展示一句引导语；但仍然完整落库（标记成 matched=True、附上
     # "无关闲聊/非常规提问"这个说明，跟问候语的记录方式一致），方便管理员事后能在对话记录/刷新
     # 恢复的聊天记录里都看到这条消息，同时也不会被误计入"转人工请求次数"这类统计。管理员可在
     # 工作台随时关闭这个判断（一键退回"全部按正常问题处理"）。打招呼、明确要求转人工的都已在
     # 上面单独处理，这里跳过，避免重复消耗一次 AI 调用、也避免被误判。
-    if not is_greeting and not is_explicit_transfer and database.get_setting("skip_irrelevant_enabled", "true") == "true":
+    # 附带图片的提问跳过这个判断：客户特意拍照发过来，本身就说明有实际咨询需求，而"这个正常吗"
+    # 这类只看文字确实像无关闲聊的说法很容易被误判成"与产品无关"，把真实需求挡在门外。
+    if (
+        not is_greeting
+        and not is_explicit_transfer
+        and not has_image
+        and database.get_setting("skip_irrelevant_enabled", "true") == "true"
+    ):
         if _is_irrelevant_question(question, product, req.model):
             irrelevant_reply = _irrelevant_reply(product)
             database.set_retrieval_info(conversation_id, True, "无关闲聊/非常规提问", irrelevant_reply, 1.0)
@@ -818,7 +921,9 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
     # 单纯打招呼（"你好""在吗"等，不带具体问题）：任何模式下都直接由 AI 回一句问候语并结束，
     # 不算"题库未命中"，不转人工、不发邮件提醒——避免客户每次只是打个招呼就惊动客服。
-    if is_greeting:
+    # 附带图片时不走这条捷径：客户发了图再说一句"你好"，真正要问的是图片，不能只回一句问候语
+    # 就把图片丢掉。
+    if is_greeting and not has_image:
         greeting_text = _greeting_reply(product)
         database.set_retrieval_info(conversation_id, True, "问候语", greeting_text, 1.0)
         database.mark_answered(conversation_id, greeting_text)
@@ -857,7 +962,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     if mode == "auto":
         result: Optional[AnswerResult] = None
         try:
-            result = _generate_ai_reply(product, question, req.model)
+            result = _generate_ai_reply(product, query, req.model)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 全AI模式生成回复失败: {exc}", file=sys.stderr)
 
@@ -874,7 +979,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
     elif mode == "collab":
         try:
-            result = _generate_ai_reply(product, question, req.model)
+            result = _generate_ai_reply(product, query, req.model)
             database.set_retrieval_info(
                 conversation_id, result.matched, result.matched_question, result.matched_answer, result.score
             )
@@ -892,7 +997,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
             print(f"[warn] 协同模式生成AI建议失败: {exc}", file=sys.stderr)
             database.set_retrieval_info(conversation_id, False, None, None, 0.0)
     elif mode == "manual":
-        _log_retrieval_only(conversation_id, product, question)
+        _log_retrieval_only(conversation_id, product, query)
 
     # 走到这里说明本次提问需要人工处理（全人工模式 / 协同或全AI模式下未命中题库）；
     # 只广播给工作台实时展示，不发邮件——邮件仅在客户主动留下邮箱后才发送。
@@ -985,8 +1090,9 @@ def list_chat_messages_by_session(session_id: str) -> dict:
 
 
 @app.post("/api/upload-image")
-async def upload_image(file: UploadFile = File(...)) -> dict:
-    """客户在聊天里发送图片：保存到数据目录并返回可访问的 URL。
+async def upload_image(session_id: str = Form(""), file: UploadFile = File(...)) -> dict:
+    """客户在聊天里发送图片：保存到数据目录，再调视觉模型把图片内容转成一段文字描述暂存起来，
+    等客户接着提问时并进问题一起走正常的题库检索/回答流程（见 /api/ask）。
     客户端拿到 URL 后自己把图片气泡按 kind=image 落库（走既有的 chat-messages 流程，
     这样刷新重放、排序都跟普通气泡一套逻辑）。"""
     ext = Path(file.filename or "").suffix.lower()
@@ -1000,8 +1106,16 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
     if len(data) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail="图片不能超过 5MB，请压缩后重试")
     name = f"{uuid.uuid4().hex}{ext}"
-    (UPLOAD_DIR / name).write_bytes(data)
-    return {"url": f"/uploads/{name}"}
+    path = UPLOAD_DIR / name
+    path.write_bytes(data)
+    url = f"/uploads/{name}"
+
+    # 识别失败（没配 Key、模型不支持、超时等）只会让这张图少一段描述，图片本身照常发送成功，
+    # 客服仍能在工作台直接看图，所以这里不把异常抛给客户端。
+    description = await asyncio.to_thread(_describe_image, path)
+    if session_id:
+        database.add_pending_image(session_id, url, description)
+    return {"url": url, "recognized": bool(description)}
 
 
 @app.get("/uploads/{filename}")
@@ -1175,6 +1289,7 @@ def agent_session_messages(session_id: str, agent: dict = Depends(get_current_ag
             "item_type": "image",
             "id": f"img-{row['id']}",
             "image_url": row["content"],
+            "image_description": row.get("description") or "",
             "created_at": row["created_at"],
         }
         for row in database.list_session_images(session_id)

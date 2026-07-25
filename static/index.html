@@ -245,23 +245,37 @@
         line-height: 1.4;
       }
 
-      textarea {
+      /* 输入框外壳：把"发送图片"的加号按钮包在输入框里面（而不是单独摆在输入框外边），
+         边框和聚焦高亮都画在外壳上，里面的 textarea 自身不再画边框。 */
+      .input-box {
         flex: 1;
-        /* 加了 📷 按钮后输入框左右各有一个按钮，窄屏上必须允许输入框收缩，
-           否则它会被挤到下一行，输入区变成两行、样式错位。 */
+        /* 窄屏上必须允许输入框收缩，否则会被发送按钮挤到下一行、输入区变成两行。 */
         min-width: 0;
-        resize: none;
-        min-height: 48px;
-        max-height: 140px;
+        display: flex;
+        align-items: flex-end;
+        gap: 6px;
         border: 1px solid #d7dfec;
         border-radius: 14px;
-        padding: 13px 14px;
-        outline: none;
-        font: inherit;
+        padding: 0 10px 0 6px;
+        background: #ffffff;
       }
 
-      textarea:focus {
+      .input-box:focus-within {
         border-color: #6A3AB7;
+      }
+
+      textarea {
+        flex: 1;
+        min-width: 0;
+        resize: none;
+        min-height: 46px;
+        max-height: 140px;
+        border: 0;
+        border-radius: 14px;
+        padding: 13px 4px;
+        outline: none;
+        background: transparent;
+        font: inherit;
       }
 
       button {
@@ -279,21 +293,26 @@
         opacity: 0.55;
       }
 
-      /* 发送图片按钮：跟发送按钮并排，但用浅色样式区分主次。用加号而不是相机 emoji——
+      /* 发送图片按钮：嵌在输入框内部左侧的一个圆形加号。用加号而不是相机 emoji——
          部分 Windows 浏览器字体里没有彩色 emoji，会渲染成一个方框。 */
       .attach-btn {
-        width: 48px;
-        flex: 0 0 48px;
-        font-size: 26px;
-        font-weight: 300;
-        line-height: 1;
+        flex: 0 0 32px;
+        width: 32px;
+        height: 32px;
+        margin-bottom: 8px;
+        border-radius: 50%;
         background: #f0f4fa;
         color: #6A3AB7;
-        border: 1px solid #d7dfec;
+        font-size: 22px;
+        font-weight: 300;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
       }
 
       .attach-btn:hover:not(:disabled) {
-        border-color: #6A3AB7;
+        background: #e6ddf5;
       }
 
       /* 聊天气泡里的图片：限制尺寸，点击可在新标签页看原图。 */
@@ -452,9 +471,11 @@
 
         <div class="composer-wrap">
           <form id="form" class="composer">
-            <button id="attach" class="attach-btn" type="button" title="发送图片" aria-label="发送图片">+</button>
-            <input id="image-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" style="display: none" />
-            <textarea id="input" placeholder="例如：孕妇能用吗？" rows="1"></textarea>
+            <div class="input-box">
+              <button id="attach" class="attach-btn" type="button" title="发送图片" aria-label="发送图片">+</button>
+              <input id="image-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" style="display: none" />
+              <textarea id="input" placeholder="例如：孕妇能用吗？" rows="1"></textarea>
+            </div>
             <button id="send" type="submit">发送</button>
           </form>
           <p class="composer-hint">如对AI回答有疑问，可与人工客服确认</p>
@@ -621,6 +642,7 @@
         if (sessionEnded) return;
         sessionEnded = true;
         clearIdleTimer();
+        clearImageFollowup();
         dismissIdlePromptButtons();
         const el = addMessage(SESSION_END_TEXT, "bot");
         updateBubbleRecord(el, { kind: "session_end", content: SESSION_END_TEXT });
@@ -1420,8 +1442,10 @@
         }
       }
 
-      // 发送图片：点相机按钮唤起系统文件选择框（手机上即相册/拍照），选中后先传到服务器
+      // 发送图片：点加号按钮唤起系统文件选择框（手机上即相册/拍照），选中后先传到服务器
       // 拿到 URL，再作为一条 kind=image 的气泡显示并落库——客服工作台的对话流里也能看到。
+      // 服务端会同时调视觉模型把图片内容转成文字描述暂存起来，客户接下来提问时自动并进问题
+      // 一起检索（见 web_app.py 的 /api/upload-image 和 /api/ask）。
       attachBtn.addEventListener("click", () => {
         if (sessionEnded) return;
         if (!currentProduct) {
@@ -1430,6 +1454,32 @@
         }
         imageInput.click();
       });
+
+      // 客户只发了图片却一直不说想问什么，服务端就永远等不到那次提问、这张图也就白发了。
+      // 发图 10 秒后仍没有提问，就主动追问一句，把对话接下去；客户在这 10 秒内自己发了问题
+      // （或又发了新图）就取消这次追问，避免多此一举地打断客户。
+      const IMAGE_FOLLOWUP_MS = 10000;
+      const IMAGE_FOLLOWUP_TEXT = "已收到您的图片～请问您想咨询关于这张图片的什么问题呢？";
+      let imageFollowupTimer = null;
+
+      function clearImageFollowup() {
+        if (imageFollowupTimer) {
+          clearTimeout(imageFollowupTimer);
+          imageFollowupTimer = null;
+        }
+      }
+
+      function scheduleImageFollowup(imageEl) {
+        clearImageFollowup();
+        imageFollowupTimer = setTimeout(() => {
+          imageFollowupTimer = null;
+          if (sessionEnded) return;
+          // 插在这张图片后面而不是聊天记录最末尾，理由同 addMessageAfter：这句追问是延迟
+          // 出现的，直接追加到末尾会跟自己所属的那张图片脱节。
+          addMessageAfter(imageEl, IMAGE_FOLLOWUP_TEXT, "bot");
+          scheduleIdleEndPrompt();
+        }, IMAGE_FOLLOWUP_MS);
+      }
 
       imageInput.addEventListener("change", async () => {
         const file = imageInput.files && imageInput.files[0];
@@ -1441,17 +1491,21 @@
         }
 
         clearIdleTimer();
+        clearImageFollowup();
         dismissIdlePromptButtons();
         attachBtn.disabled = true;
         try {
           const fd = new FormData();
           fd.append("file", file);
+          // 带上会话 id，服务端才知道这张图的识别结果该跟哪个客户的下一次提问合并。
+          fd.append("session_id", getSessionId());
           const res = await fetch("/api/upload-image", { method: "POST", body: fd });
           const data = await res.json().catch(() => ({}));
           if (!res.ok || !data.url) {
             throw new Error(data.detail || "上传失败，请稍后重试");
           }
-          addImageMessage(data.url, "user");
+          const imageEl = addImageMessage(data.url, "user");
+          scheduleImageFollowup(imageEl);
         } catch (err) {
           addMessage(`图片发送失败：${err.message}`, "bot");
         } finally {
@@ -1473,6 +1527,9 @@
         }
 
         clearIdleTimer();
+        // 客户自己提问了，不需要再追问"想咨询这张图的什么问题"——服务端会自动把刚才那张
+        // 图片的识别描述并进这次提问里一起检索。
+        clearImageFollowup();
         dismissIdlePromptButtons();
 
         input.value = "";
