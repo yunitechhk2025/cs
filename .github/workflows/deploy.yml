@@ -1,9 +1,9 @@
 name: Deploy to Aliyun ECS
 
-# 脱敏版部署策略（稳定版）：
-# 1) 用「Bootstrap server .env」工作流（手动）在服务器写入一次 ~/cs/.env
-# 2) 本工作流只负责：拉代码 + docker compose 重建
-# 不再通过 SSH envs / base64 / scp 传密钥，避免传参被截断或转义失败。
+# 脱敏演示版自动部署：
+#   步骤1 用仓库 Secrets 在服务器写入 ~/cs/.env
+#   步骤2 拉取最新代码、重建容器、健康检查（失败时自动输出容器日志）
+# 密钥只在 GitHub 端替换进脚本文本，不经过 SSH envs / base64 / scp。
 
 on:
   push:
@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  bootstrap_env:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Create server .env from repository secrets
+      - name: Write .env on server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.ECS_HOST }}
@@ -23,11 +23,20 @@ jobs:
           password: ${{ secrets.ECS_PASSWORD }}
           port: 22
           script_stop: true
+          command_timeout: 10m
           script: |
             set -e
             echo "==> write ~/cs/.env"
             mkdir -p ~/cs/data
             cd ~/cs
+
+            OLD_JWT=""
+            OLD_ADMIN_PW=""
+            if [ -f .env ]; then
+              OLD_JWT=$(grep -E '^JWT_SECRET=' .env | head -n1 | cut -d= -f2- || true)
+              OLD_ADMIN_PW=$(grep -E '^ADMIN_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)
+            fi
+
             cat > .env <<'EOF'
             OPENAI_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}
             OPENAI_MODEL=qwen3.6-flash
@@ -38,35 +47,45 @@ jobs:
             FAQ_EMBED_MODEL=text-embedding-v3
             APP_PORT=8001
 
-            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            JWT_SECRET=__KEEP__
             ADMIN_USERNAME=admin
-            ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            ADMIN_PASSWORD=__KEEP__
             DEFAULT_MODE=auto
+
+            SMTP_HOST=
+            SMTP_PORT=587
+            SMTP_USERNAME=
+            SMTP_PASSWORD=
+            SMTP_FROM=
+            SMTP_USE_TLS=true
+            SMTP_USE_SSL=false
+            NOTIFY_EMAIL_TO=
             EOF
             sed -i 's/^[[:space:]]*//' .env
+            chmod 600 .env
 
             if [ -z "$(grep -E '^OPENAI_API_KEY=' .env | cut -d= -f2-)" ]; then
-              echo "ERROR: Repository secret DASHSCOPE_API_KEY is empty or missing." >&2
+              echo "ERROR: 仓库 Secret DASHSCOPE_API_KEY 为空或未配置" >&2
               exit 1
             fi
 
-            # 可选的 JWT / 管理员密码未配置时，为脱敏演示版提供安全可运行的默认值。
-            if [ -z "$(grep -E '^JWT_SECRET=' .env | cut -d= -f2-)" ]; then
-              sed -i "s|^JWT_SECRET=$|JWT_SECRET=$(cat /proc/sys/kernel/random/uuid | tr -d '-')|" .env
-              echo "==> generated JWT_SECRET"
+            if [ -n "$OLD_JWT" ] && [ "$OLD_JWT" != "__KEEP__" ]; then
+              sed -i "s|^JWT_SECRET=__KEEP__$|JWT_SECRET=${OLD_JWT}|" .env
+            else
+              NEW_JWT=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
+              sed -i "s|^JWT_SECRET=__KEEP__$|JWT_SECRET=${NEW_JWT}|" .env
             fi
-            if [ -z "$(grep -E '^ADMIN_PASSWORD=' .env | cut -d= -f2-)" ]; then
-              sed -i 's|^ADMIN_PASSWORD=$|ADMIN_PASSWORD=changeme|' .env
-              echo "WARN: using default administrator password; change it after login."
-            fi
-            chmod 600 .env
-            echo "==> .env ready"
 
-  deploy:
-    needs: bootstrap_env
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy code over SSH
+            if [ -n "$OLD_ADMIN_PW" ] && [ "$OLD_ADMIN_PW" != "__KEEP__" ]; then
+              sed -i "s|^ADMIN_PASSWORD=__KEEP__$|ADMIN_PASSWORD=${OLD_ADMIN_PW}|" .env
+            else
+              sed -i "s|^ADMIN_PASSWORD=__KEEP__$|ADMIN_PASSWORD=changeme|" .env
+              echo "WARN: 管理员密码为默认 changeme，请登录后修改"
+            fi
+
+            echo "==> .env ready (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2-))"
+
+      - name: Update code and restart container
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.ECS_HOST }}
@@ -77,46 +96,45 @@ jobs:
           command_timeout: 30m
           script: |
             set -e
-            echo "==> prepare ~/cs"
+            echo "==> [1/5] check ~/cs"
             mkdir -p ~/cs/data
             cd ~/cs
-            pwd
+            test -f .env || { echo "ERROR: .env missing" >&2; exit 1; }
 
-            if [ ! -f .env ]; then
-              echo "ERROR: ~/cs/.env 不存在。" >&2
-              echo "请先到 Actions 手动运行一次「Bootstrap server .env」，或 SSH 自行创建 .env。" >&2
-              exit 1
-            fi
-            echo "==> .env exists (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2- || echo '?'))"
+            echo "==> [2/5] fetch latest code"
+            rm -rf /tmp/cs-src
+            git clone --depth 1 --branch main https://github.com/yunitechhk2025/cs.git /tmp/cs-src
+            cp -a /tmp/cs-src/. ~/cs/
+            rm -rf /tmp/cs-src
+            git -C ~/cs log -1 --oneline || true
 
-            echo "==> update code"
-            # 不使用 ~/cs 里历史遗留的 .git：它可能因首次部署中断或属主不同而无法 fetch。
-            # 每次都在临时目录克隆最新 main，再同步应用文件；.env 与 data 保持不动。
-            TMPDIR=$(mktemp -d)
-            trap 'rm -rf "$TMPDIR"' EXIT
-            git clone --depth 1 --branch main https://github.com/yunitechhk2025/cs.git "$TMPDIR/repo"
-            find "$TMPDIR/repo" -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} ~/cs/ \;
-            rm -rf "$TMPDIR"
-            trap - EXIT
-            echo "==> code updated: $(git -C ~/cs log -1 --oneline 2>/dev/null || echo main)"
-
-            # 确保 .env 仍在（被 ignore，reset 不会删）
-            if [ ! -f .env ]; then
-              echo "ERROR: .env missing after code update" >&2
-              exit 1
-            fi
-            mkdir -p data
-
-            echo "==> docker compose up"
+            echo "==> [3/5] docker compose up"
             if docker compose version >/dev/null 2>&1; then
-              docker compose up -d --build
-              docker compose ps
+              DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
-              docker-compose up -d --build
-              docker-compose ps
+              DC="docker-compose"
             else
               echo "ERROR: docker compose / docker-compose not found" >&2
               exit 1
             fi
+            $DC up -d --build
 
-            echo "==> deploy done"
+            echo "==> [4/5] container status"
+            sleep 8
+            $DC ps
+
+            echo "==> [5/5] health check"
+            PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2-)
+            PORT=${PORT:-8001}
+            if command -v curl >/dev/null 2>&1; then
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "http://127.0.0.1:${PORT}/" || echo 000)
+              echo "HTTP ${CODE} on 127.0.0.1:${PORT}"
+              if [ "$CODE" != "200" ]; then
+                echo "==== container logs (last 100 lines) ===="
+                $DC logs --tail=100
+                exit 1
+              fi
+            else
+              echo "WARN: curl not installed, skip health check"
+            fi
+            echo "==> deploy done, service healthy"
