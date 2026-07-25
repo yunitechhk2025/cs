@@ -279,13 +279,16 @@
         opacity: 0.55;
       }
 
-      /* 发送图片按钮：跟发送按钮并排，但用浅色样式区分主次。 */
+      /* 发送图片按钮：跟发送按钮并排，但用浅色样式区分主次。用加号而不是相机 emoji——
+         部分 Windows 浏览器字体里没有彩色 emoji，会渲染成一个方框。 */
       .attach-btn {
         width: 48px;
         flex: 0 0 48px;
-        font-size: 20px;
+        font-size: 26px;
+        font-weight: 300;
+        line-height: 1;
         background: #f0f4fa;
-        color: #172033;
+        color: #6A3AB7;
         border: 1px solid #d7dfec;
       }
 
@@ -449,7 +452,7 @@
 
         <div class="composer-wrap">
           <form id="form" class="composer">
-            <button id="attach" class="attach-btn" type="button" title="发送图片">📷</button>
+            <button id="attach" class="attach-btn" type="button" title="发送图片" aria-label="发送图片">+</button>
             <input id="image-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" style="display: none" />
             <textarea id="input" placeholder="例如：孕妇能用吗？" rows="1"></textarea>
             <button id="send" type="submit">发送</button>
