@@ -10,10 +10,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Prepare .env on runner
         env:
-          # 兼容 OPENAI_API_KEY 或 DASHSCOPE_API_KEY（二选一即可）
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
@@ -34,98 +32,155 @@ jobs:
           SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: |
+          set -e
+          API_KEY="${OPENAI_API_KEY:-}"
+          if [ -z "$API_KEY" ]; then
+            API_KEY="${DASHSCOPE_API_KEY:-}"
+          fi
+          if [ -z "$API_KEY" ]; then
+            echo "ERROR: 缺少 API Key。请配置 Repository secret：DASHSCOPE_API_KEY 或 OPENAI_API_KEY"
+            exit 1
+          fi
+
+          # 未在 Secrets 配置时写占位符，由服务器沿用旧值或首次生成
+          JWT_VAL="${JWT_SECRET:-__PRESERVE_OR_GENERATE__}"
+          ADMIN_PW_VAL="${ADMIN_PASSWORD:-__PRESERVE_OR_DEFAULT__}"
+
+          umask 077
+          cat > "$GITHUB_WORKSPACE/cs.env" <<EOF
+          OPENAI_API_KEY=${API_KEY}
+          OPENAI_MODEL=${OPENAI_MODEL:-qwen3.6-flash}
+          OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}
+
+          FAQ_TOP_K=${FAQ_TOP_K:-8}
+          FAQ_MIN_SCORE=${FAQ_MIN_SCORE:-0.05}
+          FAQ_EMBED_MODEL=${FAQ_EMBED_MODEL:-text-embedding-v3}
+          APP_PORT=${APP_PORT:-8001}
+
+          JWT_SECRET=${JWT_VAL}
+          ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+          ADMIN_PASSWORD=${ADMIN_PW_VAL}
+          DEFAULT_MODE=${DEFAULT_MODE:-auto}
+
+          SMTP_HOST=${SMTP_HOST:-}
+          SMTP_PORT=${SMTP_PORT:-587}
+          SMTP_USERNAME=${SMTP_USERNAME:-}
+          SMTP_PASSWORD=${SMTP_PASSWORD:-}
+          SMTP_FROM=${SMTP_FROM:-}
+          SMTP_USE_TLS=${SMTP_USE_TLS:-true}
+          SMTP_USE_SSL=${SMTP_USE_SSL:-false}
+          NOTIFY_EMAIL_TO=${NOTIFY_EMAIL_TO:-}
+          EOF
+          sed -i 's/^[[:space:]]*//' "$GITHUB_WORKSPACE/cs.env"
+          echo "Prepared cs.env for upload"
+
+      - name: Ensure remote directory
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.ECS_HOST }}
           username: ${{ secrets.ECS_USER }}
           password: ${{ secrets.ECS_PASSWORD }}
           port: 22
           script_stop: true
-          # 把上面 env 传进远程 SSH 会话，供生成 .env 使用
-          envs: OPENAI_API_KEY,DASHSCOPE_API_KEY,OPENAI_MODEL,OPENAI_BASE_URL,FAQ_TOP_K,FAQ_MIN_SCORE,FAQ_EMBED_MODEL,APP_PORT,JWT_SECRET,ADMIN_USERNAME,ADMIN_PASSWORD,DEFAULT_MODE,SMTP_HOST,SMTP_PORT,SMTP_USERNAME,SMTP_PASSWORD,SMTP_FROM,SMTP_USE_TLS,SMTP_USE_SSL,NOTIFY_EMAIL_TO
           script: |
             set -e
-            # 脱敏版与正式版同机部署：目录 ~/cs，对外端口见 .env 的 APP_PORT（默认 8001）
-            mkdir -p ~/cs
+            echo "==> prepare ~/cs"
+            mkdir -p ~/cs/data
+
+      - name: Upload .env
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          source: "cs.env"
+          target: "~/cs/"
+          overwrite: true
+
+      - name: Deploy code and restart container
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          script_stop: true
+          command_timeout: 30m
+          script: |
+            set -e
+            echo "==> enter ~/cs"
             cd ~/cs
+            pwd
+
+            if [ ! -f cs.env ]; then
+              echo "ERROR: cs.env was not uploaded" >&2
+              exit 1
+            fi
+
+            OLD_JWT=""
+            OLD_ADMIN_PW=""
+            if [ -f .env ]; then
+              OLD_JWT=$(grep -E '^JWT_SECRET=' .env | head -n1 | cut -d= -f2- || true)
+              OLD_ADMIN_PW=$(grep -E '^ADMIN_PASSWORD=' .env | head -n1 | cut -d= -f2- || true)
+            fi
+
+            mv -f cs.env .env
+            chmod 600 .env
+
+            if grep -q '^JWT_SECRET=__PRESERVE_OR_GENERATE__$' .env; then
+              if [ -n "$OLD_JWT" ]; then
+                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${OLD_JWT}|" .env
+              else
+                NEW_JWT=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
+                sed -i "s|^JWT_SECRET=__PRESERVE_OR_GENERATE__$|JWT_SECRET=${NEW_JWT}|" .env
+                echo "==> generated new JWT_SECRET"
+              fi
+            fi
+
+            if grep -q '^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$' .env; then
+              if [ -n "$OLD_ADMIN_PW" ] && [ "$OLD_ADMIN_PW" != "__PRESERVE_OR_DEFAULT__" ]; then
+                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=${OLD_ADMIN_PW}|" .env
+              else
+                sed -i "s|^ADMIN_PASSWORD=__PRESERVE_OR_DEFAULT__$|ADMIN_PASSWORD=changeme|" .env
+                echo "WARN: using default admin/changeme"
+              fi
+            fi
+
+            echo "==> .env ready (APP_PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2-))"
+
+            echo "==> update code"
             if [ ! -d .git ]; then
-              git clone https://github.com/yunitechhk2025/cs.git .
+              TMPDIR=$(mktemp -d)
+              git clone https://github.com/yunitechhk2025/cs.git "$TMPDIR/repo"
+              # 同步代码，保留 .env 与 data
+              find "$TMPDIR/repo" -mindepth 1 -maxdepth 1 ! -name '.git' -exec cp -a {} ~/cs/ \;
+              cp -a "$TMPDIR/repo/.git" ~/cs/
+              rm -rf "$TMPDIR"
             else
               git remote set-url origin https://github.com/yunitechhk2025/cs.git
               git fetch origin main
               git reset --hard origin/main
             fi
+            git log -1 --oneline
 
-            # 用 GitHub Secrets 在服务器上生成 .env（不进 git）
-            python3 <<'PY'
-            import os
-            import secrets as pysecrets
-            from pathlib import Path
-
-            def opt(name: str, default: str = "") -> str:
-                value = (os.environ.get(name) or "").strip()
-                return value if value else default
-
-            def read_existing_env(path: Path) -> dict:
-                data = {}
-                if not path.is_file():
-                    return data
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, _, value = line.partition("=")
-                    data[key.strip()] = value.strip()
-                return data
-
-            existing = read_existing_env(Path(".env"))
-
-            api_key = opt("OPENAI_API_KEY") or opt("DASHSCOPE_API_KEY")
-            if not api_key:
-                raise SystemExit(
-                    "ERROR: 缺少 API Key。请在 Repository secrets 中配置 "
-                    "DASHSCOPE_API_KEY 或 OPENAI_API_KEY。"
-                )
-
-            jwt_secret = opt("JWT_SECRET") or existing.get("JWT_SECRET") or pysecrets.token_hex(32)
-            admin_password = (
-                opt("ADMIN_PASSWORD")
-                or existing.get("ADMIN_PASSWORD")
-                or "changeme"
-            )
-            if not opt("ADMIN_PASSWORD") and not existing.get("ADMIN_PASSWORD"):
-                print("WARN: 未配置 ADMIN_PASSWORD，脱敏版默认使用 admin / changeme，请登录后立刻修改。")
-
-            lines = [
-                f"OPENAI_API_KEY={api_key}",
-                f"OPENAI_MODEL={opt('OPENAI_MODEL', 'qwen3.6-flash')}",
-                f"OPENAI_BASE_URL={opt('OPENAI_BASE_URL', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1')}",
-                "",
-                f"FAQ_TOP_K={opt('FAQ_TOP_K', '8')}",
-                f"FAQ_MIN_SCORE={opt('FAQ_MIN_SCORE', '0.05')}",
-                f"FAQ_EMBED_MODEL={opt('FAQ_EMBED_MODEL', 'text-embedding-v3')}",
-                f"APP_PORT={opt('APP_PORT', '8001')}",
-                "",
-                f"JWT_SECRET={jwt_secret}",
-                f"ADMIN_USERNAME={opt('ADMIN_USERNAME', 'admin')}",
-                f"ADMIN_PASSWORD={admin_password}",
-                f"DEFAULT_MODE={opt('DEFAULT_MODE', 'auto')}",
-                "",
-                f"SMTP_HOST={opt('SMTP_HOST')}",
-                f"SMTP_PORT={opt('SMTP_PORT', '587')}",
-                f"SMTP_USERNAME={opt('SMTP_USERNAME')}",
-                f"SMTP_PASSWORD={opt('SMTP_PASSWORD')}",
-                f"SMTP_FROM={opt('SMTP_FROM')}",
-                f"SMTP_USE_TLS={opt('SMTP_USE_TLS', 'true')}",
-                f"SMTP_USE_SSL={opt('SMTP_USE_SSL', 'false')}",
-                f"NOTIFY_EMAIL_TO={opt('NOTIFY_EMAIL_TO')}",
-                "",
-            ]
-            path = Path(".env")
-            path.write_text("\n".join(lines), encoding="utf-8")
-            path.chmod(0o600)
-            print("Wrote ~/cs/.env from GitHub Secrets")
-            PY
-
+            if [ ! -f .env ]; then
+              echo "ERROR: .env missing after code update" >&2
+              exit 1
+            fi
             mkdir -p data
-            docker compose up -d --build
-            docker compose ps
+
+            echo "==> docker compose up"
+            if docker compose version >/dev/null 2>&1; then
+              docker compose up -d --build
+              docker compose ps
+            elif command -v docker-compose >/dev/null 2>&1; then
+              docker-compose up -d --build
+              docker-compose ps
+            else
+              echo "ERROR: docker compose / docker-compose not found" >&2
+              exit 1
+            fi
+
+            echo "==> deploy done"
