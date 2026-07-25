@@ -20,7 +20,20 @@ jobs:
           script_stop: true
           script: |
             set -e
-            cd ~/fuyunhon_cs
-            git pull origin main
+            # 脱敏版与正式版同机部署：目录 ~/cs，对外端口见 .env 的 APP_PORT（默认 8001）
+            mkdir -p ~/cs
+            cd ~/cs
+            if [ ! -d .git ]; then
+              git clone https://github.com/yunitechhk2025/cs.git .
+            else
+              git remote set-url origin https://github.com/yunitechhk2025/cs.git
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+            if [ ! -f .env ]; then
+              echo "ERROR: ~/cs/.env 不存在。请先在服务器上复制 .env.example 为 .env 并填好 OPENAI_API_KEY 等配置。" >&2
+              exit 1
+            fi
+            mkdir -p data
             docker compose up -d --build
             docker compose ps

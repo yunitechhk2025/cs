@@ -137,7 +137,7 @@ OPENAI_BASE_URL=https://你的兼容接口/v1
 OPENAI_MODEL=gpt-4o-mini
 FAQ_TOP_K=8
 FAQ_MIN_SCORE=0.1
-APP_PORT=8000
+APP_PORT=8001
 ```
 
 客服工作台相关配置（新增）：
@@ -162,10 +162,10 @@ DEFAULT_MODE=auto
 docker compose up --build
 ```
 
-然后打开：
+然后打开（脱敏版默认端口，见 `.env` 的 `APP_PORT`）：
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8001
 ```
 
 后台运行：
@@ -191,7 +191,7 @@ docker compose logs -f
 访问：
 
 ```text
-http://127.0.0.1:8000/agent
+http://127.0.0.1:8001/agent
 ```
 
 用 `.env` 中配置的管理员账号登录（默认 `admin` / 见 `ADMIN_PASSWORD`）。
@@ -255,22 +255,44 @@ python excel_rag_chatbot.py --excel "2026.01.26_肤润康-常见咨询问题_v2(
 - `OPENAI_MODEL`：模型名，默认 `qwen3.6-flash`
 - `OPENAI_BASE_URL`：默认 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
 
-## 7) GitHub 自动部署到阿里云 ECS
+## 7) GitHub 自动部署到阿里云 ECS（脱敏版，与正式版同机）
+
+本仓库是**脱敏演示版**，可与正式版（`fuyunhon_cs`，通常占 `8000`）部署在同一台 ECS 上，互不覆盖：
+
+| | 正式版 | 脱敏版（本仓库） |
+| --- | --- | --- |
+| 仓库 | `yunitechhk2025/fuyunhon_cs` | `yunitechhk2025/cs` |
+| 服务器目录 | `~/fuyunhon_cs` | `~/cs` |
+| 容器名 | `fuyunhon-faq-chatbot` | `cs-demo-chatbot` |
+| 对外端口 | `8000` | `8001`（`.env` 里 `APP_PORT`） |
+| 访问地址 | `http://IP:8000` | `http://IP:8001` |
 
 仓库已包含 `.github/workflows/deploy.yml`。
 
-在 GitHub → Settings → Secrets and variables → Actions 添加：
+在 GitHub → Settings → Secrets and variables → Actions → **Repository secrets** 添加：
 
-- `ECS_HOST`：服务器公网 IP
+- `ECS_HOST`：服务器公网 IP（可与正式版相同）
 - `ECS_USER`：SSH 用户名（如 `root`）
 - `ECS_PASSWORD`：SSH 密码
 
-服务器需先手动部署一次，并保留 `~/fuyunhon_cs/.env`（不要提交到 Git）。
+**首次部署前**请先 SSH 登录服务器，准备 `.env`（Actions 不会自动创建密钥配置）：
 
-之后每次 `push` 到 `main`，GitHub Actions 会自动：
+```bash
+mkdir -p ~/cs/data
+cd ~/cs
+# 若目录还是空的，可先手动 clone 一次；之后也可直接靠 Actions 自动 clone
+git clone https://github.com/yunitechhk2025/cs.git .
+cp .env.example .env
+# 编辑 .env：填 OPENAI_API_KEY，确认 APP_PORT=8001，并改掉 JWT_SECRET / ADMIN_PASSWORD
+nano .env
+```
+
+同时在云安全组放行 **8001** 端口。
+
+之后每次 `push` 到 `main`（或手动跑 Actions → Deploy to Aliyun ECS），会自动：
 
 1. SSH 登录 ECS
-2. `git pull origin main`
-3. `docker compose up -d --build`
+2. 更新 `~/cs` 代码（clone 或 reset 到最新 `main`）
+3. `docker compose up -d --build`（映射到宿主机 `8001`）
 
-> **升级到三种模式后的一次性操作**：由于 `.env` 不会被 `git pull` 更新，首次部署本次更新前，请手动 SSH 登录服务器，在 `~/fuyunhon_cs/.env` 中补充 `JWT_SECRET`、`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`DEFAULT_MODE`（参考 `.env.example`），保存后再让 GitHub Actions 触发部署，或手动执行一次 `docker compose up -d --build`。同时确保服务器上存在 `~/fuyunhon_cs/data` 目录（`docker-compose.yml` 已配置挂载，用于持久化客服账号与对话数据）。
+> `.env` 与 `data/` 不会被 git 覆盖；脱敏版与正式版必须使用各自独立的目录、容器名、端口和数据库卷，避免串数据和抢端口。

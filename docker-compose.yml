@@ -1,11 +1,12 @@
 services:
   faq-chatbot:
     build: .
-    container_name: fuyunhon-faq-chatbot
+    # 脱敏版独立容器名，避免与同机正式版 fuyunhon-faq-chatbot 冲突
+    container_name: cs-demo-chatbot
     env_file:
       - .env
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${APP_PORT:-8001}:8000"
     volumes:
       - "./2026.01.26_肤润康-常见咨询问题_v2(1).xls:/data/faq.xls:ro"
       - "./data:/app/data"

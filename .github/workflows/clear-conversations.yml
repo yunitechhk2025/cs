@@ -19,8 +19,10 @@ jobs:
           script_stop: true
           script: |
             set -e
-            cd ~/fuyunhon_cs
-            git pull origin main
+            cd ~/cs
+            git remote set-url origin https://github.com/yunitechhk2025/cs.git
+            git fetch origin main
+            git reset --hard origin/main
             # 确保容器在跑且代码已更新到最新（含清理脚本）
             docker compose up -d --build
             docker compose exec -T faq-chatbot \
