@@ -16,15 +16,9 @@ jobs:
           username: ${{ secrets.ECS_USER }}
           password: ${{ secrets.ECS_PASSWORD }}
           port: 22
-          script_stop: true
+          script_stop: false
           script: |
             set -e
-            cd ~/cs
-            git remote set-url origin https://github.com/yunitechhk2025/cs.git
-            git fetch origin main
-            git reset --hard origin/main
-            # 确保容器在跑且代码已更新到最新（含清理脚本）
-            docker compose up -d --build
-            docker compose exec -T faq-chatbot \
-              python scripts/clear_conversations.py --yes
+            # 容器由部署工作流以 docker run 启动（名字 cs-demo-chatbot），直接 exec 即可
+            docker exec cs-demo-chatbot python scripts/clear_conversations.py --yes
             echo "Conversation data cleared."
