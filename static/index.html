@@ -967,6 +967,10 @@
               ? `已将您的问题「${question}」更新给人工客服，请耐心等待客服通过邮箱【${email}】回复您～`
               : `已将您的问题更新给人工客服，请耐心等待客服通过邮箱【${email}】回复您～`;
             addMessage(confirmText, "bot");
+            // 邮箱留完就只等邮件回复了，通知发起轮询的那一方把这轮等待从闲置计时的
+            // 计数里摘掉（见 pollAnswer 里的 releaseWaitForEmailReply），这样 20 秒没
+            // 动静时客服机器人照样会问一句"是否结束本次对话"。
+            if (typeof el._onEmailLeft === "function") el._onEmailLeft();
           } catch (err) {
             submitBtn.disabled = false;
             showStatus("提交失败，请稍后重试");
@@ -1476,6 +1480,23 @@
         let followUpEl = options.followUpEl || null;
         const skipBusy = !!options.skipBusy;
 
+        // 客户留了邮箱之后就只等客服发邮件回复了，这种等待可能长达几小时，不该一直压着
+        // 20 秒闲置计时（scheduleIdleEndPrompt 在 activeWaits > 0 时不启动），否则客服机器人
+        // 永远不会问那句"是否结束本次对话"。所以确认文案一出现就把这轮等待从计数里摘掉，
+        // 让闲置计时照常跑；轮询本身继续在后台进行，客服如果直接在工作台回复，答案照样会
+        // 写进对应的气泡里。
+        let waitReleased = false;
+        function releaseWaitForEmailReply() {
+          if (waitReleased) return;
+          waitReleased = true;
+          endWait();
+        }
+        // 刷新前就已经留过邮箱、"已邮件通知客服"的提示也早就出现过（skipBusy）的情况：
+        // 这次不会再走下面的计时器，直接摘掉。
+        if (emailProvided && skipBusy) releaseWaitForEmailReply();
+        // 刷新恢复出来的留邮箱表单：客户在这个表单里补填邮箱时同样要摘掉这轮等待。
+        if (followUpEl) followUpEl._onEmailLeft = releaseWaitForEmailReply;
+
         // matched=true 说明题库已命中、AI 正在准备自动发送，这个等待过程从头到尾都跟"人工客服"无关，
         // 全程只应该出现"AI"相关的话术，绝不能出现"转人工/人工客服正忙"这类文案，避免误导客户。
         // 只有 matched=false（题库未命中，真正转人工）时，才会在等太久后提示客户就地留下邮箱；
@@ -1509,12 +1530,14 @@
                 // busy_note：刷新恢复时据此判断"人工客服正忙"提示已经出现过（skipBusy），
                 // 不要再起计时器重复补一条。
                 updateBubbleRecord(followUpEl, { kind: "busy_note", conversation_id: conversationId });
+                releaseWaitForEmailReply();
               }
             }, remainingMs)
           : setTimeout(() => {
               if (!answered) {
                 followUpEl = addMessageAfter(loadingEl, "", "bot");
                 renderLeaveEmailPrompt(followUpEl, conversationId, question);
+                followUpEl._onEmailLeft = releaseWaitForEmailReply;
               }
             }, remainingMs);
 
@@ -1535,7 +1558,13 @@
               // 拿到最终回复后这个气泡就是一条普通文字消息了（哪怕它之前是留邮箱的表单），
               // 明细里也改回 text，刷新重放时直接按静态文字渲染。
               updateBubbleRecord(targetEl, { kind: "text", conversation_id: conversationId });
-              endWait();
+              // 等待计数在留邮箱时可能已经摘掉了，这里不能再减一次（会把别的对话的等待
+              // 也一起清零），但客服的回复同样算一轮问答结束，闲置计时要从这一刻重新开始。
+              if (waitReleased) {
+                noteExchangeCompleted();
+              } else {
+                endWait();
+              }
               return;
             }
           } catch (err) {
