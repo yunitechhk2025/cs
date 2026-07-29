@@ -510,7 +510,7 @@
         </header>
 
         <div id="messages" class="messages">
-          <div class="message bot">你好，我是 YUNI AI 客服。请先选择您要咨询的产品，我再为您解答。</div>
+          <div class="message bot">您好，我是 YUNI AI 客服。请先选择您要咨询的产品，我再为您解答。</div>
         </div>
 
         <div class="composer-wrap">
@@ -717,6 +717,7 @@
         clearIdleTimer();
         clearImageFollowup();
         dismissIdlePromptButtons();
+        sessionStorage.setItem(SESSION_ENDED_KEY, "1");
         const el = addMessage(SESSION_END_TEXT, "bot");
         updateBubbleRecord(el, { kind: "session_end", content: SESSION_END_TEXT });
         setComposerEnabled(false);
@@ -744,6 +745,12 @@
       // 刷新页面（F5）不会清空，正好可以借它的这段生命周期恢复聊天记录；但客户把标签页叉掉/
       // 关闭浏览器后，sessionStorage 会被清空，下次再打开就是全新会话，不会继续沿用旧的历史记录。
       const SESSION_KEY = "fuyunhon_session_id";
+      // 会话是否已经主动结束，跟 session id 一样存在 sessionStorage 里。结束语承诺"刷新
+      // 页面即可重新开始"，所以下一次加载页面时要丢掉旧的 session id 从头开始，而不是把
+      // 已结束的聊天记录连同锁死的输入框一起恢复出来。判断"上一次是不是结束了"不能只靠
+      // 拉回来的历史记录（请求可能失败、老会话也可能没有明细），所以在结束的那一刻就写下
+      // 这个标记，页面一加载同步读它即可，不依赖任何网络请求。
+      const SESSION_ENDED_KEY = "fuyunhon_session_ended";
       function getSessionId() {
         let id = sessionStorage.getItem(SESSION_KEY);
         if (!id) {
@@ -756,7 +763,7 @@
       // ---------------- 聊天记录逐条落库（刷新后按原样重放的"治本"机制） ----------------
       // conversations 表每条对话只存一行最终状态（最终的问题内容、最终留的邮箱等），刷新页面
       // 如果只靠它"推演"聊天记录，转人工这类多步流程的过程性消息（"好的，请您简单描述…"、
-      // "人工客服正忙，留下你的邮箱…"、第一次确认语等）就会丢失或措辞对不上，看起来像换了
+      // "人工客服正忙，留下您的邮箱…"、第一次确认语等）就会丢失或措辞对不上，看起来像换了
       // 一个界面。这里改成：每显示一条消息气泡就往后端落库一行（chat_messages 明细表），DOM
       // 里的每个气泡对应明细表里的一行；等待类气泡"先占位、后原地更新"（"AI 正在思考…"最终
       // 被答案替换时，同一行记录的内容也跟着更新）。刷新页面时按明细逐条重放，跟刷新前看到
@@ -903,7 +910,7 @@
         el.innerHTML = "";
 
         const textEl = document.createElement("div");
-        textEl.textContent = "人工客服正忙，留下你的邮箱，客服稍后通过邮箱回复您";
+        textEl.textContent = "人工客服正忙，留下您的邮箱，客服稍后通过邮箱回复您";
         el.appendChild(textEl);
 
         // 明细里标记成 email_form：刷新时如果这条对话还没留邮箱也没被回复，要把这个气泡
@@ -1086,7 +1093,7 @@
             } else {
               // 没留邮箱：先确认已经把具体问题更新给客服；如果等太久（>10秒）客服仍未回复，
               // 会像常规流程一样在下面新增一条"人工客服正忙，留邮箱"的提示。
-              setFinalText(followUp, `已将你的问题「${question}」更新给人工客服，请稍候`);
+              setFinalText(followUp, `已将您的问题「${question}」更新给人工客服，请稍候`);
               updateBubbleRecord(followUp, { kind: "waiting", conversation_id: conversationId });
               pollAnswer(conversationId, followUp, false, mode, { question, emailProvided: false }).catch(() => {});
             }
@@ -1119,7 +1126,7 @@
         });
       }
 
-      const PRODUCT_SELECTED_TEXT = "你好，请问想咨询什么？";
+      const PRODUCT_SELECTED_TEXT = "您好，请问想咨询什么？";
 
       function selectProduct(id, options) {
         const silent = options && options.silent;
@@ -1158,6 +1165,7 @@
 
       switchProductLink.addEventListener("click", (event) => {
         event.preventDefault();
+        if (sessionEnded) return;
         pickerOverlay.style.display = "flex";
       });
 
@@ -1190,6 +1198,12 @@
             msgItems = ((await msgRes.json()) || {}).items || [];
           }
           if (msgItems.length) {
+            // 兜底：结束时还没有 fuyunhon_session_ended 标记的老会话，从明细里看出它已经
+            // 结束过，同样按"重新开始"处理——丢掉旧会话、不重放，别把锁死的输入框恢复出来。
+            if (msgItems.some((row) => row.kind === "session_end")) {
+              sessionStorage.removeItem(SESSION_KEY);
+              return;
+            }
             replayChatMessages(msgItems, convItems);
           } else {
             // 老会话兜底：这个会话开始于"逐条落库"功能上线之前，明细表里没有记录，只能按
@@ -1379,7 +1393,7 @@
             const initialText = item.is_explicit_transfer
               ? item.email
                 ? `已将您的问题「${item.question}」更新给人工客服，请耐心等待客服回复您～`
-                : `已将你的问题「${item.question}」更新给人工客服，请稍候`
+                : `已将您的问题「${item.question}」更新给人工客服，请稍候`
               : item.matched
               ? "AI 正在思考您的问题，请稍候..."
               : "已收到您的问题，正在为您转接人工客服，请稍候";
@@ -1400,6 +1414,14 @@
         } catch (err) {
           // 拉取历史失败时静默忽略，不影响客户继续正常提问
         }
+      }
+
+      // 上一次对话已经主动结束：这次刷新就是客户要"重新开始"，丢掉旧的 session id 从空白
+      // 开始（旧的聊天记录仍完整留在库里，工作台照样看得到），下面的 restoreHistory 也就
+      // 不会再把已结束的会话恢复出来。
+      if (sessionStorage.getItem(SESSION_ENDED_KEY) === "1") {
+        sessionStorage.removeItem(SESSION_ENDED_KEY);
+        sessionStorage.removeItem(SESSION_KEY);
       }
 
       initProducts();
