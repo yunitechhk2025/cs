@@ -1119,6 +1119,8 @@
         });
       }
 
+      const PRODUCT_SELECTED_TEXT = "你好，请问想咨询什么？";
+
       function selectProduct(id, options) {
         const silent = options && options.silent;
         const isSwitch = !!currentProduct && currentProduct !== id;
@@ -1129,6 +1131,11 @@
         pickerOverlay.style.display = "none";
         if (isSwitch && !silent) {
           addMessage(`已切换到「${productLabel(id)}」，请描述您想咨询的问题～`, "bot");
+        } else if (!silent && !sessionStorage.getItem(SESSION_KEY)) {
+          // 首次选定产品：接着开场白再说一句，把话头交给客户。
+          // 有会话 id 说明这是刷新页面后重新选产品，这句话已经在恢复出来的聊天记录里了，
+          // 不能再补一条，否则每刷新一次就多一句一模一样的问候。
+          addMessage(PRODUCT_SELECTED_TEXT, "bot");
         }
         input.focus();
       }
