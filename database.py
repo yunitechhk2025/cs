@@ -99,6 +99,32 @@ def init_db() -> None:
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            -- WhatsApp 客户：一个手机号（wa_id）就是一个客户，对应一个固定的 session_id
+            -- （形如 wa:85212345678），这样工作台按 session_id 分组的那套逻辑不用改就能把
+            -- WhatsApp 客户当成普通访客展示。product 记住这个客户选的产品（WhatsApp 上没有
+            -- 网页那种常驻的"当前咨询"标签，只能服务端记着）；awaiting_transfer_conversation_id
+            -- 记住"客户刚说了转人工、还等着他补充具体问题"的那条对话，客户下一句话要补进
+            -- 那条对话里，而不是新建一条，否则队列里会留下一条只写着"转人工"的空对话。
+            CREATE TABLE IF NOT EXISTS whatsapp_contacts (
+                wa_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                profile_name TEXT,
+                product TEXT,
+                awaiting_transfer_conversation_id INTEGER,
+                -- 客户还没选产品就先把问题发过来了：先把这句话存着，等他点完产品按钮
+                -- 立刻按这个问题作答，不用让客户把同一句话再打一遍。
+                pending_question TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Meta 在没收到 200 应答时会重推同一条消息，重推的 message id 与首次相同。
+            -- 这张表用来去重，避免同一句话被回答两遍、同一张图被识别两次。
+            CREATE TABLE IF NOT EXISTS whatsapp_processed_messages (
+                message_id TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pending_images_session ON pending_images(session_id, consumed);
             CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
             CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
@@ -634,4 +660,88 @@ def set_conversation_image(conversation_id: int, image_url: str, image_descripti
         conn.execute(
             "UPDATE conversations SET image_url = ?, image_description = ? WHERE id = ?",
             (image_url, image_description, conversation_id),
+        )
+
+
+# ---------- WhatsApp ----------
+
+def whatsapp_session_id(wa_id: str) -> str:
+    """WhatsApp 客户的会话标识：用固定前缀加手机号，跟网页端随机生成的 uuid 天然不会撞车，
+    工作台那边也能一眼看出这条对话来自 WhatsApp。同一个号码永远是同一个会话（不像网页
+    那样关掉标签页就重新开始），客户几天后再来问，客服看到的是完整的历史。"""
+    return f"wa:{wa_id}"
+
+
+def get_whatsapp_contact(wa_id: str) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM whatsapp_contacts WHERE wa_id = ?", (wa_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_whatsapp_contact(wa_id: str, profile_name: Optional[str] = None) -> dict:
+    """确保这个号码有一条联系人记录并返回它（含产品选择等状态）。"""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO whatsapp_contacts (wa_id, session_id, profile_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(wa_id) DO UPDATE SET
+                profile_name = COALESCE(excluded.profile_name, whatsapp_contacts.profile_name),
+                updated_at = datetime('now')
+            """,
+            (wa_id, whatsapp_session_id(wa_id), profile_name),
+        )
+        row = conn.execute("SELECT * FROM whatsapp_contacts WHERE wa_id = ?", (wa_id,)).fetchone()
+        return dict(row)
+
+
+def set_whatsapp_product(wa_id: str, product: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE whatsapp_contacts SET product = ?, updated_at = datetime('now') WHERE wa_id = ?",
+            (product, wa_id),
+        )
+
+
+def set_whatsapp_pending_question(wa_id: str, question: Optional[str]) -> None:
+    """暂存/清除客户在选产品之前就发来的那个问题。"""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE whatsapp_contacts SET pending_question = ?, updated_at = datetime('now') WHERE wa_id = ?",
+            (question, wa_id),
+        )
+
+
+def set_whatsapp_awaiting_transfer(wa_id: str, conversation_id: Optional[int]) -> None:
+    """记住/清除"客户说了转人工，正等他补充具体问题"的那条对话。"""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE whatsapp_contacts
+            SET awaiting_transfer_conversation_id = ?, updated_at = datetime('now')
+            WHERE wa_id = ?
+            """,
+            (conversation_id, wa_id),
+        )
+
+
+def mark_whatsapp_message_processed(message_id: str) -> bool:
+    """记下这条 webhook 消息已经处理过。返回 True 表示是第一次见到（应当处理），
+    返回 False 表示是 Meta 的重推，直接忽略即可。"""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO whatsapp_processed_messages (message_id) VALUES (?)",
+            (message_id,),
+        )
+        return cur.rowcount > 0
+
+
+def prune_whatsapp_processed_messages(keep_days: int = 7) -> None:
+    """去重表只用于挡住 Meta 几分钟内的重推，旧记录没有保留价值，定期清掉避免无限增长。"""
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM whatsapp_processed_messages WHERE created_at < datetime('now', ?)",
+            (f"-{int(keep_days)} days",),
         )

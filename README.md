@@ -118,6 +118,20 @@
 - **识别失败不影响主流程**：没配 `OPENAI_API_KEY`、模型不支持图片、超时等情况下描述为空字符串，图片照常发送成功、客服照常能看图，只是这次提问不带图片描述。
 - **客服工作台**：图片本身不产生 `conversations` 记录，`GET /api/agent/sessions/{session_id}` 会把图片按时间插进该会话的问答流里（`item_type=image`），并带上 AI 识别描述；附带了图片的那条提问也会显示「📷 本次提问附带客户图片，AI 识别：…」，客服可以核对 AI 到底"看见了什么"。因为会话列表仍由 `conversations` 分组而来，如果客户只发了图、还没提过任何问题，该会话要等他发出第一条文字提问后才会出现在列表里。
 
+### WhatsApp 接入（WhatsApp Cloud API）
+
+客户可以直接在 WhatsApp 里咨询，答案与网页端完全一致：webhook 收到消息后调的是**同一个** `_process_question()`（`/api/ask` 也只是它的一层薄封装），题库检索、命中判定、无关内容过滤、三种工作模式的行为一模一样，改一处两个渠道同时生效。没配 WhatsApp 相关环境变量时，webhook 拒绝所有请求，其余功能完全不受影响。
+
+- **接口**：`GET /api/whatsapp/webhook` 是 Meta 的握手校验（比对 `hub.verify_token` 后把 `hub.challenge` 以**纯文本**原样返回，返回 JSON 会验证失败，这是最常见的坑）；`POST /api/whatsapp/webhook` 接收消息事件。`GET /api/whatsapp/status`（需管理员登录）用来自查各项配置是否就绪，不返回任何密钥内容。
+- **安全**：每个 POST 都校验 `X-Hub-Signature-256`（用 app secret 做 HMAC-SHA256）。未配置 `WHATSAPP_APP_SECRET` 时跳过校验并打警告，方便刚接通时先跑流程，正式对外前必须配上——webhook 地址是公网可访问的。
+- **20 秒应答**：Meta 要求 20 秒内返回 200，否则判定失败并不断重推。识别图片、调 AI 远超这个时间，所以端点只做校验和解析，处理丢进 `BackgroundTasks`。重推的 message id 与首次相同，`whatsapp_processed_messages` 表按 message id 去重，避免同一句话被回答两遍。
+- **会话映射**：一个手机号就是一个客户，`session_id` 固定为 `wa:<手机号>`。工作台按 `session_id` 分组的逻辑因此完全不用改，WhatsApp 客户就是一个普通访客（`client_ip` 列显示成 `WhatsApp <手机号>`，一眼能看出渠道）。与网页端不同的是，WhatsApp 会话不会因为"关掉标签页"而重置，客户几天后再来，客服看到的是完整历史。
+- **产品选择**：用 Meta 的交互式按钮（`whatsapp_contacts.product` 记住选择，按钮标题上限 20 字符）。客户没选产品就先发了问题时，那句话会暂存在 `pending_question`，点完按钮立刻按它作答，不用让客户重打一遍。客户说"切换产品/换产品/重新选择"等关键词会重新弹出按钮。
+- **图片**：webhook 给的是 media id，需要两步下载（先换 5 分钟有效的临时地址，再带令牌取内容），存进和网页端同一个 `data/uploads/`，走同一个视觉模型识别成描述后存入 `pending_images`——之后的提问会自动合并（逻辑与网页端共用）。图片自带 caption 时等于"图 + 问题"一起发来，直接按 caption 作答；只发图不说话则回一句追问。
+- **转人工**：客户说"转人工"这类没有实际内容的话时，记下这条对话（`awaiting_transfer_conversation_id`），客户下一句话补进**同一条**对话里，避免队列里留下一条只写着"转人工"的空对话；这句补充的问题同样要过一遍无关内容判断，否则客户可以靠一句"转人工"绕开拦截。网页端那套"留邮箱等邮件回复"在 WhatsApp 上不需要——客服直接回 WhatsApp 即可。
+- **客服回复要"推"出去**：网页端客户是自己轮询把答案拉回去的，WhatsApp 没有这个机制，所以 `agent_answer()` 和协同模式的 `_auto_send_after_timeout()` 在标记已回复后都会调 `_push_answer_to_whatsapp()`。**注意 Meta 的 24 小时客服窗口**：客户最后一条消息之后超过 24 小时，普通文本会被拒收，只能改用审批过的模板消息（当前未实现，发送失败会把 Meta 的原始报错打进日志）。
+- **代码位置**：`whatsapp.py` 只封装"跟 Meta 打交道"这一层（发消息、下载媒体、校验签名、长文本拆分），业务流程都在 `web_app.py` 的 `_handle_whatsapp_*` 系列函数里，以后要换成 BSP（Twilio、360dialog 等）只需要替换 `whatsapp.py`。
+
 ### 客服工作台：回复框显示规则 / 草稿保存
 
 回复框（`compose-area`）只在对话真正需要客服手动处理时才会渲染：题库未命中、全人工模式的任意问题、或客户主动要求转人工，这三种情况会显示；全AI模式已直接回复、或人机协同模式题库命中且 AI 已生成建议（进入自动发送倒计时）这两种情况**不会**显示回复框，因为这类对话不需要人工介入（AI 已经处理完，或即将自动发送）。

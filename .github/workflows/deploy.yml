@@ -4,6 +4,8 @@ name: Deploy to Aliyun ECS
 #   步骤1 用仓库 Secrets 在服务器写入 ~/cs/.env
 #   步骤2 拉最新代码、docker build、docker run 启动、健康检查（失败自动打印容器日志）
 #
+# WHATSAPP_* 四个 Secret 没配时会写成空值，WhatsApp 接入自动处于关闭状态，不影响网页端。
+#
 # 两个经验教训（勿改回去）：
 #   - script_stop 必须为 false：它会往脚本每行间注入检查语句，把 heredoc 写出的 .env 污染掉
 #   - 启动用 docker run 而不是 docker compose：服务器上老版 compose 插件(v2.29.7)配新版
@@ -55,6 +57,12 @@ jobs:
             ADMIN_USERNAME=admin
             ADMIN_PASSWORD=__KEEP__
             DEFAULT_MODE=auto
+
+            WHATSAPP_ACCESS_TOKEN=${{ secrets.WHATSAPP_ACCESS_TOKEN }}
+            WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+            WHATSAPP_VERIFY_TOKEN=${{ secrets.WHATSAPP_VERIFY_TOKEN }}
+            WHATSAPP_APP_SECRET=${{ secrets.WHATSAPP_APP_SECRET }}
+            WHATSAPP_API_VERSION=v21.0
 
             SMTP_HOST=
             SMTP_PORT=587

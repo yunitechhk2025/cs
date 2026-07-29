@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hmac
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -22,11 +24,12 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import database
+import whatsapp
 from auth import create_token, decode_token, get_current_agent, require_admin
 from doc_rag_chatbot import DocRagBot
 from email_utils import DEFAULT_NOTIFY_EMAIL_TO, send_email, send_test_email
@@ -285,6 +288,9 @@ async def startup() -> None:
                 existing_bot.load_extra_items(shared_items)
             else:
                 bots[product_id] = ExcelFaqRagBot.from_items(shared_items, top_k=top_k, min_score=min_score)
+
+    # WhatsApp 的重推去重表只在几分钟内有意义，旧记录清掉，避免长期无限增长。
+    database.prune_whatsapp_processed_messages()
 
     asyncio.create_task(_reminder_loop())
     asyncio.create_task(_daily_report_loop())
@@ -564,6 +570,7 @@ async def _auto_send_after_timeout(conversation_id: int, ai_answer: str, timeout
             return
         database.mark_answered(conversation_id, ai_answer, answered_by=None, answered_by_name=AUTO_SEND_AGENT_NAME)
         await manager.broadcast({"type": "answered", "id": conversation_id})
+        await _push_answer_to_whatsapp(conversation, ai_answer)
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] 协同模式自动发送失败: {exc}", file=sys.stderr)
 
@@ -875,16 +882,34 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     question = req.message.strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
+    return await _process_question(
+        question,
+        req.session_id or str(uuid.uuid4()),
+        req.product,
+        req.model,
+        _client_ip(request),
+    )
 
-    session_id = req.session_id or str(uuid.uuid4())
-    product = _normalize_product(req.product)
+
+async def _process_question(
+    question: str,
+    session_id: str,
+    product: Optional[str],
+    model: Optional[str],
+    client_ip: Optional[str],
+) -> AskResponse:
+    """一次提问的完整处理流程：落库、并入客户刚发的图片、无关闲聊/打招呼/转人工判断、
+    按当前工作模式检索题库并生成回复。网页端（/api/ask）和 WhatsApp webhook 共用这一段，
+    两个渠道的回答行为因此完全一致——改一处两边同时生效，不会出现"网页答得对、WhatsApp
+    答得不一样"的分叉。"""
+    product = _normalize_product(product)
     mode = database.get_setting("global_mode", "auto")
     is_greeting = _is_pure_greeting(question)
     # 客户直接说"转人工""人工客服"之类，是明确的转接要求，不是需要检索/AI 判断的正常问题——
     # 要在"无关闲聊"判断之前拦截，否则可能被误判成"与产品无关"而回一句引导语（真实发生过的 bug）。
     is_explicit_transfer = not is_greeting and _is_explicit_transfer_request(question)
 
-    conversation_id = database.create_conversation(session_id, question, mode, _client_ip(request), product)
+    conversation_id = database.create_conversation(session_id, question, mode, client_ip, product)
 
     # 客户刚发来、还没被任何提问用掉的图片：把视觉模型给出的文字描述并进本次提问，作为
     # 一个完整问题走后面正常的检索/回答流程。conversations.question 仍然只存客户自己打的
@@ -913,7 +938,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
         and not has_image
         and database.get_setting("skip_irrelevant_enabled", "true") == "true"
     ):
-        if _is_irrelevant_question(question, product, req.model):
+        if _is_irrelevant_question(question, product, model):
             irrelevant_reply = _irrelevant_reply(product)
             database.set_retrieval_info(conversation_id, True, "无关闲聊/非常规提问", irrelevant_reply, 1.0)
             database.mark_answered(conversation_id, irrelevant_reply)
@@ -962,7 +987,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
     if mode == "auto":
         result: Optional[AnswerResult] = None
         try:
-            result = _generate_ai_reply(product, query, req.model)
+            result = _generate_ai_reply(product, query, model)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 全AI模式生成回复失败: {exc}", file=sys.stderr)
 
@@ -979,7 +1004,7 @@ async def ask(req: AskRequest, request: Request) -> AskResponse:
 
     elif mode == "collab":
         try:
-            result = _generate_ai_reply(product, query, req.model)
+            result = _generate_ai_reply(product, query, model)
             database.set_retrieval_info(
                 conversation_id, result.matched, result.matched_question, result.matched_answer, result.score
             )
@@ -1227,6 +1252,260 @@ async def submit_transfer_question(conversation_id: int, req: TransferQuestionRe
     return {"success": True, "irrelevant": False}
 
 
+# ---------------- WhatsApp 接入 ----------------
+# 客户在 WhatsApp 里得到的答案，跟网页端走的是同一套问答逻辑（_process_question），
+# 工作台也不用改：WhatsApp 客户的 session_id 固定是 "wa:手机号"，在工作台里就是一个
+# 普通访客。区别只在表达方式——WhatsApp 没有网页那种表单、按钮气泡和轮询，所有过程性
+# 提示都得是一条能独立看懂的消息，产品选择用 Meta 的交互式按钮实现。
+
+WA_WELCOME_TEXT = f"您好，我是 {BRAND_NAME} AI 客服～请先选择您要咨询的产品："
+WA_PRODUCT_PROMPT = "请选择您要咨询的产品："
+WA_PRODUCT_CHOSEN_TEXT = "好的，请问想咨询什么？"
+WA_TRANSFER_PENDING_TEXT = "已收到您的问题，正在为您转接人工客服，请稍候～"
+WA_TRANSFER_DETAILS_TEXT = "好的，请把您想咨询的问题发给我，我马上转给人工客服～"
+WA_IMAGE_ONLY_TEXT = "已收到您的图片～请问想咨询这张图片的什么问题呢？"
+WA_IMAGE_FAILED_TEXT = "抱歉，这张图片没能接收成功，麻烦您重新发一次，或直接用文字描述一下～"
+WA_UNSUPPORTED_TEXT = "抱歉，目前只能处理文字和图片消息，麻烦您用文字描述一下想咨询的问题～"
+# 客户想换一款产品咨询时的口语说法（网页端是点"切换产品"链接，WhatsApp 只能靠关键词）
+WA_SWITCH_PRODUCT_KEYWORDS = ("切换产品", "换产品", "换个产品", "重新选择", "选择产品", "选产品")
+WA_PRODUCT_BUTTON_PREFIX = "product:"
+WA_MIME_EXTS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+
+@app.get("/api/whatsapp/webhook")
+def whatsapp_verify(request: Request) -> PlainTextResponse:
+    """Meta 在后台保存 webhook 地址时会先发一个 GET 握手请求：verify token 对得上，就把
+    hub.challenge 原样以纯文本返回。返回 JSON 或多余的内容都会导致验证失败，这是接入
+    WhatsApp 时最常见的坑。"""
+    params = request.query_params
+    expected = whatsapp.verify_token()
+    provided = params.get("hub.verify_token") or ""
+    if params.get("hub.mode") == "subscribe" and expected and hmac.compare_digest(provided, expected):
+        return PlainTextResponse(params.get("hub.challenge") or "")
+    raise HTTPException(status_code=403, detail="verify token 不匹配")
+
+
+@app.post("/api/whatsapp/webhook")
+async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> dict:
+    """接收 Meta 推来的消息事件。
+
+    Meta 要求 20 秒内返回 200，否则会判定失败并不断重推同一条消息；而识别图片、调用 AI
+    生成回答远不止 20 秒，所以这里只做签名校验和解析，真正的处理丢进后台任务，立刻应答。"""
+    raw = await request.body()
+    if not whatsapp.check_signature(raw, request.headers.get("X-Hub-Signature-256")):
+        raise HTTPException(status_code=403, detail="签名校验失败")
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+    background.add_task(_handle_whatsapp_payload, payload)
+    return {"success": True}
+
+
+@app.get("/api/whatsapp/status")
+def whatsapp_status(agent: dict = Depends(require_admin)) -> dict:
+    """给管理员自查用：只报告各项配置有没有填，不返回任何密钥内容。"""
+    return {
+        "configured": whatsapp.is_configured(),
+        "phone_number_id_set": bool(whatsapp.phone_number_id()),
+        "access_token_set": bool(whatsapp.access_token()),
+        "verify_token_set": bool(whatsapp.verify_token()),
+        "app_secret_set": bool(whatsapp.app_secret()),
+        "api_version": whatsapp.api_version(),
+    }
+
+
+async def _handle_whatsapp_payload(payload: dict) -> None:
+    """拆开 Meta 那层套了四五层的 webhook 结构，逐条消息处理。
+    送达/已读回执（value.statuses）这里不需要，天然会被跳过（它们没有 messages 字段）。"""
+    try:
+        for entry in payload.get("entry") or []:
+            for change in entry.get("changes") or []:
+                value = change.get("value") or {}
+                contacts = {c.get("wa_id"): c for c in (value.get("contacts") or [])}
+                for message in value.get("messages") or []:
+                    await _handle_whatsapp_message(message, contacts.get(message.get("from")) or {})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] WhatsApp webhook 处理失败: {exc}", file=sys.stderr)
+
+
+async def _handle_whatsapp_message(message: dict, contact_info: dict) -> None:
+    wa_id = (message.get("from") or "").strip()
+    message_id = (message.get("id") or "").strip()
+    if not wa_id or not message_id:
+        return
+    # Meta 没收到 200 就会重推，重推的 message id 与首次相同；这里挡掉重复处理，
+    # 否则同一句话会被回答两遍、同一张图会被视觉模型识别两次。
+    if not database.mark_whatsapp_message_processed(message_id):
+        return
+
+    profile_name = ((contact_info.get("profile") or {}).get("name") or "").strip() or None
+    contact = database.upsert_whatsapp_contact(wa_id, profile_name)
+    await whatsapp.mark_read(message_id)
+
+    msg_type = message.get("type")
+    if msg_type == "text":
+        await _handle_whatsapp_text(wa_id, contact, ((message.get("text") or {}).get("body") or "").strip())
+    elif msg_type == "image":
+        await _handle_whatsapp_image(wa_id, contact, message.get("image") or {})
+    elif msg_type == "interactive":
+        await _handle_whatsapp_interactive(wa_id, message.get("interactive") or {})
+    else:
+        # 语音、视频、文件、位置、名片等：现有题库和视觉模型都处理不了，礼貌引导回文字。
+        await whatsapp.send_text(wa_id, WA_UNSUPPORTED_TEXT)
+
+
+async def _send_whatsapp_product_picker(wa_id: str, lead_text: str) -> None:
+    buttons = [
+        (f"{WA_PRODUCT_BUTTON_PREFIX}{product_id}", meta["label"])
+        for product_id, meta in PRODUCTS.items()
+    ]
+    await whatsapp.send_buttons(wa_id, lead_text, buttons)
+
+
+async def _handle_whatsapp_interactive(wa_id: str, interactive: dict) -> None:
+    reply = interactive.get("button_reply") or interactive.get("list_reply") or {}
+    choice = reply.get("id") or ""
+    if not choice.startswith(WA_PRODUCT_BUTTON_PREFIX):
+        await whatsapp.send_text(wa_id, WA_UNSUPPORTED_TEXT)
+        return
+
+    product = _normalize_product(choice[len(WA_PRODUCT_BUTTON_PREFIX) :])
+    database.set_whatsapp_product(wa_id, product)
+    contact = database.get_whatsapp_contact(wa_id) or {}
+    pending_question = (contact.get("pending_question") or "").strip()
+    if pending_question:
+        # 客户是先问了问题、被要求先选产品的：选完立刻按那个问题作答，不用他再打一遍。
+        database.set_whatsapp_pending_question(wa_id, None)
+        contact["product"] = product
+        await _whatsapp_answer_question(wa_id, contact, pending_question)
+        return
+    await whatsapp.send_text(wa_id, WA_PRODUCT_CHOSEN_TEXT)
+
+
+async def _handle_whatsapp_text(wa_id: str, contact: dict, text: str) -> None:
+    if not text:
+        return
+    if any(keyword in text for keyword in WA_SWITCH_PRODUCT_KEYWORDS):
+        await _send_whatsapp_product_picker(wa_id, WA_PRODUCT_PROMPT)
+        return
+    if not contact.get("product"):
+        database.set_whatsapp_pending_question(wa_id, text)
+        await _send_whatsapp_product_picker(wa_id, WA_WELCOME_TEXT)
+        return
+    awaiting_id = contact.get("awaiting_transfer_conversation_id")
+    if awaiting_id:
+        await _whatsapp_submit_transfer_question(wa_id, int(awaiting_id), text)
+        return
+    await _whatsapp_answer_question(wa_id, contact, text)
+
+
+async def _whatsapp_answer_question(wa_id: str, contact: dict, text: str) -> None:
+    """把客户这句话交给跟网页端完全相同的问答流程，再按结果决定回什么。"""
+    result = await _process_question(
+        text,
+        contact.get("session_id") or database.whatsapp_session_id(wa_id),
+        contact.get("product"),
+        None,
+        f"WhatsApp {wa_id}",
+    )
+    if result.status == "answered" and result.answer:
+        await whatsapp.send_text(wa_id, result.answer)
+        return
+    if result.need_transfer_details:
+        # 客户说了"转人工"这类没有实际内容的话：记住这条对话，等他把真正想问的问题发过来
+        # 补进同一条对话里，避免工作台队列里留下一条只写着"转人工"的空对话。
+        database.set_whatsapp_awaiting_transfer(wa_id, result.conversation_id)
+        await whatsapp.send_text(wa_id, WA_TRANSFER_DETAILS_TEXT)
+        return
+    if result.matched:
+        # 人机协同模式且题库已命中：AI 建议已进入几秒后的自动发送倒计时，答案会由
+        # _auto_send_after_timeout 推送过来，这里不用先回一句没信息量的"请稍候"。
+        return
+    await whatsapp.send_text(wa_id, WA_TRANSFER_PENDING_TEXT)
+
+
+async def _whatsapp_submit_transfer_question(wa_id: str, conversation_id: int, text: str) -> None:
+    """客户说完"转人工"之后补充的具体问题：更新到原来那条对话里，逻辑与网页端的
+    /api/conversations/{id}/transfer-question 保持一致（同样要过一遍无关内容判断，
+    否则客户可以靠一句"转人工"绕开这道拦截，把无关内容直接推给人工客服）。"""
+    database.set_whatsapp_awaiting_transfer(wa_id, None)
+    conversation = database.get_conversation(conversation_id)
+    if conversation is None or conversation["status"] == "answered":
+        # 客服已经处理完了，这句话按新问题走正常流程。
+        await _whatsapp_answer_question(wa_id, database.get_whatsapp_contact(wa_id) or {}, text)
+        return
+
+    database.set_question(conversation_id, text)
+    if database.get_setting("skip_irrelevant_enabled", "true") == "true":
+        if _is_irrelevant_question(text, conversation["product"], None):
+            irrelevant_reply = _irrelevant_reply(conversation["product"])
+            database.set_retrieval_info(conversation_id, True, "无关闲聊/非常规提问", irrelevant_reply, 1.0)
+            database.mark_answered(conversation_id, irrelevant_reply)
+            await whatsapp.send_text(wa_id, irrelevant_reply)
+            return
+
+    conversation = database.get_conversation(conversation_id)
+    await manager.broadcast({"type": "conversation_updated", "conversation": dict(conversation)})
+    await whatsapp.send_text(wa_id, f"已将您的问题「{text}」更新给人工客服，请稍候～")
+
+
+async def _handle_whatsapp_image(wa_id: str, contact: dict, image: dict) -> None:
+    """客户发来的图片：下载下来存进和网页端同一个目录，走同一个视觉模型识别成文字描述，
+    再存进 pending_images——之后客户的提问会自动把这段描述并进去（见 _process_question）。
+    图片自带文字说明（caption）时，等于"图 + 问题"一起发来，直接按那句话作答。"""
+    media_id = (image.get("id") or "").strip()
+    caption = (image.get("caption") or "").strip()
+    if not media_id:
+        await whatsapp.send_text(wa_id, WA_IMAGE_FAILED_TEXT)
+        return
+
+    data, mime = await whatsapp.download_media(media_id)
+    if not data:
+        await whatsapp.send_text(wa_id, WA_IMAGE_FAILED_TEXT)
+        return
+    if len(data) > MAX_IMAGE_BYTES:
+        await whatsapp.send_text(wa_id, "图片太大了（超过 5MB），麻烦压缩后再发一次～")
+        return
+
+    ext = WA_MIME_EXTS.get(mime, ".jpg")
+    name = f"{uuid.uuid4().hex}{ext}"
+    path = UPLOAD_DIR / name
+    path.write_bytes(data)
+    session_id = contact.get("session_id") or database.whatsapp_session_id(wa_id)
+    # 识别失败只是少一段描述，图片本身照常留在工作台供客服直接查看，所以不打断流程。
+    description = await asyncio.to_thread(_describe_image, path)
+    database.add_pending_image(session_id, f"/uploads/{name}", description)
+
+    if not contact.get("product"):
+        # 还没选产品：图片已经存下（10 分钟内有效），选完产品再提问就会自动带上它。
+        await _send_whatsapp_product_picker(wa_id, WA_WELCOME_TEXT)
+        return
+    if caption:
+        await _whatsapp_answer_question(wa_id, contact, caption)
+        return
+    await whatsapp.send_text(wa_id, WA_IMAGE_ONLY_TEXT)
+
+
+async def _push_answer_to_whatsapp(conversation, answer: str) -> None:
+    """客服在工作台回复、或协同模式自动发送之后，把最终答案主动推回客户的 WhatsApp。
+    网页端客户是自己轮询把答案拉回去的，WhatsApp 没有这个机制，必须由服务端推。
+
+    注意 Meta 的 24 小时客服窗口：客户最后一条消息之后超过 24 小时，这种普通文本会被
+    拒收（只能改用审批过的模板消息），失败时 whatsapp.py 会把 Meta 的原始报错打进日志。"""
+    if conversation is None:
+        return
+    session_id = conversation["session_id"] or ""
+    if not session_id.startswith("wa:"):
+        return
+    await whatsapp.send_text(session_id[len("wa:") :], answer)
+
+
 # ---------------- 客服端 ----------------
 
 @app.post("/api/agent/login")
@@ -1314,6 +1593,8 @@ async def agent_answer(
 
     database.mark_answered(conversation_id, answer_text, agent["id"], agent["display_name"])
     await manager.broadcast({"type": "answered", "id": conversation_id})
+    # 网页端客户会自己轮询拿到这条回复；WhatsApp 客户必须由服务端主动推过去。
+    await _push_answer_to_whatsapp(conversation, answer_text)
     return {"success": True}
 
 
