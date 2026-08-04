@@ -1,0 +1,116 @@
+name: Setup HTTPS
+
+# 给客服系统配一个正式域名 + HTTPS：手动触发一次即可，之后证书由 certbot 自动续期。
+#
+# 服务器上已经有 nginx 1.24 在管着 443 端口（另一个服务用），所以这里**不新装反向代理**，
+# 只往 /etc/nginx/conf.d/ 里加一个独属于本域名的配置文件，再用 certbot 单独给它签证书。
+# 全程不碰任何已有的配置文件，reload 之前一律先 nginx -t，语法不过就中止，不会波及现有服务。
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 客服系统要用的域名（需已解析到本服务器且 80/443 已放行）
+        required: true
+        default: chat.yuniagent.ai
+      email:
+        description: Let's Encrypt 通知邮箱（证书快过期/续期失败时会发到这里）
+        required: true
+        default: yunitechhk@gmail.com
+      app_port:
+        description: 客服系统监听的本地端口
+        required: true
+        default: "8001"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure nginx and issue certificate
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          script_stop: false
+          command_timeout: 15m
+          script: |
+            set -e
+            DOMAIN="${{ github.event.inputs.domain }}"
+            EMAIL="${{ github.event.inputs.email }}"
+            APP_PORT="${{ github.event.inputs.app_port }}"
+            SUDO=""
+            [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+            CONF="/etc/nginx/conf.d/${DOMAIN}.conf"
+
+            echo "==> [1/6] 现有 nginx 站点（仅查看，不修改）"
+            $SUDO nginx -v 2>&1
+            $SUDO grep -rhE "^[[:space:]]*server_name" /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+              | sed 's/^[[:space:]]*//' | sort -u
+
+            echo "==> [2/6] 确认应用在本机 ${APP_PORT} 端口正常"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${APP_PORT}/" || echo 000)
+            echo "127.0.0.1:${APP_PORT} -> ${CODE}"
+            if [ "$CODE" != "200" ]; then
+              echo "ERROR: 客服系统没有在 ${APP_PORT} 端口正常响应，先修好再配 HTTPS" >&2
+              exit 1
+            fi
+
+            echo "==> [3/6] 写入 ${CONF}（只新增这一个文件）"
+            $SUDO tee "$CONF" >/dev/null <<EOF
+            # 客服系统（YUNI AI 客服）专用站点，由 GitHub Actions 的 setup-https 生成。
+            # 变量名带 cs_ 前缀，避免与服务器上其他配置里的同名变量冲突。
+            map \$http_upgrade \$cs_connection_upgrade {
+                default upgrade;
+                ''      close;
+            }
+
+            server {
+                listen 80;
+                server_name ${DOMAIN};
+
+                # 客户可以发最大 5MB 的图片，留一倍余量
+                client_max_body_size 10m;
+
+                location / {
+                    proxy_pass http://127.0.0.1:${APP_PORT};
+                    proxy_http_version 1.1;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    # 工作台靠 WebSocket 实时收新问题，这两行不能少
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection \$cs_connection_upgrade;
+                    proxy_read_timeout 300s;
+                }
+            }
+            EOF
+
+            echo "==> [4/6] 语法检查并生效"
+            $SUDO nginx -t
+            $SUDO systemctl reload nginx
+
+            echo "==> [5/6] 申请证书（certbot 会自动改写上面这个文件，加上 443 与跳转）"
+            if ! command -v certbot >/dev/null 2>&1; then
+              echo "-- 安装 certbot --"
+              $SUDO apt-get update -y
+              $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
+            fi
+            $SUDO certbot --nginx -d "$DOMAIN" \
+              --non-interactive --agree-tos -m "$EMAIL" \
+              --redirect --keep-until-expiring
+            $SUDO nginx -t
+            $SUDO systemctl reload nginx
+
+            echo "==> [6/6] 验证"
+            HTTPS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "https://${DOMAIN}/" || echo 000)
+            REDIRECT=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "http://${DOMAIN}/" || echo 000)
+            HOOK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "https://${DOMAIN}/api/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=probe&hub.challenge=1" || echo 000)
+            echo "https://${DOMAIN}/ -> ${HTTPS_CODE}（期望 200）"
+            echo "http://${DOMAIN}/ -> ${REDIRECT}（期望 301，自动跳 https）"
+            echo "webhook 探测 -> ${HOOK}（403 表示路由已通、只是 verify token 还没配；404 说明代码没更新）"
+            $SUDO certbot certificates 2>/dev/null | grep -A2 "$DOMAIN" || true
+            [ "$HTTPS_CODE" = "200" ] || { echo "ERROR: HTTPS 未通" >&2; exit 1; }
+            echo "==> 完成：https://${DOMAIN} 已可用，证书到期前 certbot 会自动续期"
