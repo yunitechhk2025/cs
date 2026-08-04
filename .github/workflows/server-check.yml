@@ -1,0 +1,83 @@
+name: Server check
+
+# 一次性的服务器现状体检：手动触发，登上 ECS 收集"谁在占用 80/443、有没有 nginx/caddy、
+# 跑着哪些容器"这些信息，写回仓库的 server-status.txt，方便照着现状决定 HTTPS 怎么配。
+# 只读命令，不改服务器上的任何东西。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect server info
+        id: collect
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          password: ${{ secrets.ECS_PASSWORD }}
+          port: 22
+          script_stop: false
+          command_timeout: 5m
+          script: |
+            echo "===== 监听中的端口 ====="
+            (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -v "^$"
+
+            echo "===== docker 容器 ====="
+            docker ps --format '{{.Names}} | {{.Image}} | {{.Ports}}' 2>/dev/null || echo "docker 不可用"
+
+            echo "===== nginx ====="
+            if command -v nginx >/dev/null 2>&1; then
+              nginx -v 2>&1
+              echo "-- 配置文件 --"
+              ls -1 /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null
+              echo "-- server_name 汇总 --"
+              grep -rhE "server_name|listen|proxy_pass" /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | sed 's/^[[:space:]]*//'
+            else
+              echo "未安装 nginx"
+            fi
+
+            echo "===== caddy ====="
+            if command -v caddy >/dev/null 2>&1; then
+              caddy version
+              echo "-- Caddyfile --"
+              cat /etc/caddy/Caddyfile 2>/dev/null
+            else
+              echo "未安装 caddy"
+            fi
+
+            echo "===== 其他常见反代 ====="
+            command -v apache2 httpd traefik 2>/dev/null || echo "无 apache/traefik"
+
+            echo "===== 系统信息 ====="
+            (. /etc/os-release && echo "$PRETTY_NAME") 2>/dev/null
+            echo "包管理器: $(command -v apt-get || command -v yum || command -v dnf)"
+
+            echo "===== 本机 curl 自检 ====="
+            for p in 80 443 8000 8001; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:$p/" || echo 000)
+              echo "127.0.0.1:$p -> $code"
+            done
+
+      - name: Save result to repo
+        run: |
+          {
+            echo "# 服务器现状（由 server-check workflow 自动生成）"
+            echo "生成时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            cat <<'REPORT'
+          ${{ steps.collect.outputs.stdout }}
+          REPORT
+          } > server-status.txt
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add server-status.txt
+          git commit -m "chore: 记录服务器现状" || echo "没有变化"
+          git push
