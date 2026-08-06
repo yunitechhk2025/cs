@@ -148,4 +148,10 @@ jobs:
             else
               echo "WARN: curl not installed, skip health check"
             fi
+
+            # 默认工作模式设为全 AI（auto）。库里已有 global_mode 时仅改 .env 不会生效，
+            # 这里在每次部署后显式写入，保证上线就是全 AI；之后仍可在工作台临时切换。
+            echo "==> set global_mode=auto (全AI)"
+            docker exec cs-demo-chatbot python -c "import database; database.set_setting('global_mode', 'auto'); print(database.get_setting('global_mode'))"
+
             echo "==> deploy done, service healthy"
