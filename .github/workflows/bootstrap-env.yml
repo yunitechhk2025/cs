@@ -1,7 +1,7 @@
 name: Bootstrap server .env
 
 # 手动运行一次：把 Repository Secrets 写进服务器 ~/cs/.env
-# 写法：由 GitHub Actions 在发送脚本前替换 ${{ secrets.* }}，
+# 写法：由 GitHub Actions 在发送脚本前替换各个 secrets 占位符，
 # 不走 SSH envs / base64 / scp，避免传参失败。
 
 on:
@@ -33,7 +33,7 @@ jobs:
               echo "==> found existing .env, will preserve JWT/ADMIN_PASSWORD when possible"
             fi
 
-            # 下面的 ${{ }} 在 GitHub 端已替换成真实值后再发给服务器。
+            # 下面的占位符在 GitHub 端已替换成真实值后再发给服务器。
             # 使用单引号 heredoc，避免密钥里的 $ 被远程 shell 再展开。
             cat > .env <<'EOF'
             OPENAI_API_KEY=${{ secrets.DASHSCOPE_API_KEY }}
