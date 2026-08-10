@@ -742,9 +742,17 @@ def _log_retrieval_only(conversation_id: int, product: str, question: str) -> No
                     conversation_id, True, best["item"].question, best["item"].answer, round(evidence, 4)
                 )
             else:
-                database.set_retrieval_info(
-                    conversation_id, False, None, None, detailed[0]["score"] if detailed else 0.0
+                miss_evidence = (
+                    round(
+                        retrieval_evidence(
+                            detailed[0]["lexical"], detailed[0]["semantic"], detailed[0]["in_both"]
+                        ),
+                        4,
+                    )
+                    if detailed
+                    else 0.0
                 )
+                database.set_retrieval_info(conversation_id, False, None, None, miss_evidence)
             return
         # 文档题库（DocRagBot）等没有 retrieve_detailed 的检索器：沿用原始综合分。
         # 文档条目是 DocChunk（title/text），没有 question/answer 字段，做一层兼容。
@@ -1055,8 +1063,9 @@ async def _process_question(
             # 存成建议草稿，客服在工作台一键采纳或改写后发送，不会自动发送。
             database.set_ai_suggestion(conversation_id, result.text, result.confidence)
         else:
+            # 未命中也记录（最高候选的）置信度，工作台跟"未找到匹配内容"一起展示，供调阈值参考
             database.set_retrieval_info(
-                conversation_id, False, None, None, result.score if result is not None else 0.0
+                conversation_id, False, None, None, result.confidence if result is not None else 0.0
             )
 
     elif mode == "collab":
@@ -1067,7 +1076,7 @@ async def _process_question(
                 result.matched,
                 result.matched_question,
                 result.matched_answer,
-                result.confidence if result.matched else result.score,
+                result.confidence,
             )
             if result.matched:
                 database.set_ai_suggestion(conversation_id, result.text, result.confidence)

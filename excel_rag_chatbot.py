@@ -465,13 +465,26 @@ class ExcelFaqRagBot:
                     matched_answer=item.answer,
                     confidence=confidence,
                 )
-            return AnswerResult(text=self._not_found_text(), matched=False, score=ranked[0][0])
+            # AI 判定所有候选都不匹配：置信度记录检索最高候选的证据分（校准后 0-1 尺度），
+            # 工作台把它跟"未找到匹配内容"一起展示，方便管理员观察分布、决定阈值调多少。
+            top = detailed[0]
+            return AnswerResult(
+                text=self._not_found_text(),
+                matched=False,
+                score=ranked[0][0],
+                confidence=round(retrieval_evidence(top["lexical"], top["semantic"], top["in_both"]), 4),
+            )
 
         # AI 调用异常时的兜底：仅依赖关键词检索分数；没有 AI 判断背书，置信度按检索证据打对折
         best = detailed[0]
         best_score, best_item = best["score"], best["item"]
         if best_score < self.min_score:
-            return AnswerResult(text=self._not_found_text(), matched=False, score=best_score)
+            return AnswerResult(
+                text=self._not_found_text(),
+                matched=False,
+                score=best_score,
+                confidence=round(retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4),
+            )
         fallback_confidence = round(
             0.5 * retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4
         )

@@ -258,8 +258,12 @@ class DocRagBot:
             return AnswerResult(text="抱歉，产品资料为空或尚未建立索引。", matched=False, score=0.0)
 
         best_score = ranked[0][0]
+        # 未命中时也给出最高候选的证据分（校准后 0-1 尺度），供工作台展示参考
+        miss_confidence = round(max(calibrate_lexical(best_score), calibrate_semantic(best_score)), 4)
         if best_score < self.min_score:
-            return AnswerResult(text=self._not_found_text(), matched=False, score=best_score)
+            return AnswerResult(
+                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+            )
 
         try:
             raw_answer = self._call_ai_answer(
@@ -267,10 +271,14 @@ class DocRagBot:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 文档RAG生成回复失败: {exc}", file=sys.stderr)
-            return AnswerResult(text=self._not_found_text(), matched=False, score=best_score)
+            return AnswerResult(
+                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+            )
 
         if not raw_answer or NO_ANSWER_TOKEN in raw_answer:
-            return AnswerResult(text=self._not_found_text(), matched=False, score=best_score)
+            return AnswerResult(
+                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+            )
 
         matched_titles = "、".join(item.title for _, item in ranked if _ >= self.min_score * 0.6)
         matched_texts = "\n\n".join(item.text for _, item in ranked if _ >= self.min_score * 0.6)

@@ -1829,9 +1829,13 @@
             </div>`;
         }
         if (item.matched === 0) {
+          // 未命中也展示置信度（检索最高候选的证据分）：低于阈值被拦下来的对话和真正
+          // 无关的对话都在这里，管理员靠这个数字观察分布、决定阈值该调高还是调低。
+          const missScoreText =
+            typeof item.match_score === "number" ? `（置信度 ${(item.match_score * 100).toFixed(0)}%）` : "";
           return `
             <div class="intent-wrap">
-              <span class="intent-badge miss">⚠️ AI 识别：未找到匹配内容</span>
+              <span class="intent-badge miss">⚠️ AI 识别：未找到匹配内容${missScoreText}</span>
               <div class="msg-badges">${badgesHtml}</div>
               <div class="intent-card">${missHint}</div>
             </div>`;
