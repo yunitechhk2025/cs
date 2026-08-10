@@ -210,17 +210,10 @@ class ExcelFaqRagBot:
         self._build_semantic_index()
 
     def _get_ai_client(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("未安装 openai 依赖，请执行: pip install openai") from exc
+        # 复用进程内缓存的客户端（见 ai_client.py），避免每次调用都重做 TLS 握手
+        from ai_client import get_ai_client
 
-        return OpenAI(
-            api_key=api_key or os.getenv("OPENAI_API_KEY", "EMPTY"),
-            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
-            timeout=30.0,
-            max_retries=2,
-        )
+        return get_ai_client(api_key=api_key, base_url=base_url, timeout=30.0, max_retries=2)
 
     def _build_semantic_index(self, batch_size: int = 10, attempts: int = 3) -> None:
         """为所有题库问题计算一次语义向量，用于弥补字符检索对同义/口语化改写问句的召回不足。
@@ -389,6 +382,9 @@ class ExcelFaqRagBot:
         resp = client.chat.completions.create(
             model=model,
             temperature=0.1,
+            # 输出只是 {"index","greeting","confidence"} 的小 JSON（开场白限 20 字），
+            # 限制输出长度防模型偶尔啰嗦拖慢响应
+            max_tokens=200,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

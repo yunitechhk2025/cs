@@ -31,6 +31,7 @@ from pydantic import BaseModel
 import database
 import whatsapp
 from auth import create_token, decode_token, get_current_agent, require_admin
+from ai_client import get_ai_client
 from doc_rag_chatbot import DocRagBot
 from email_utils import DEFAULT_NOTIFY_EMAIL_TO, send_email, send_test_email
 from excel_rag_chatbot import AnswerResult, ExcelFaqRagBot, retrieval_evidence
@@ -420,11 +421,6 @@ def _greeting_reply(product: str) -> str:
 # False，退回到原有的检索/转人工流程，避免真实的客户问题被误判成"无关"而悄悄漏单。
 # 管理员可在工作台通过 skip_irrelevant_enabled 设置随时关闭这个判断，一键退回"全部按正常问题处理"。
 def _classify_irrelevant(question: str, product: str, model: Optional[str]) -> bool:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return False
-
     product_label = PRODUCTS.get(product, {}).get("label", "该产品")
     system_prompt = (
         f"你是电商客服的预处理模块，只做一件事：判断客户这句话是否与「{product_label}」的产品咨询完全无关，"
@@ -445,15 +441,12 @@ def _classify_irrelevant(question: str, product: str, model: Optional[str]) -> b
         '只输出如下 JSON，不要输出任何其他文字：{"irrelevant": true 或 false}'
     )
     try:
-        client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            timeout=15.0,
-            max_retries=1,
-        )
+        client = get_ai_client(timeout=15.0, max_retries=1)
         resp = client.chat.completions.create(
             model=_ai_model(model),
             temperature=0,
+            # 输出只是一个 {"irrelevant": bool} 的小 JSON，限制输出长度防模型偶尔啰嗦拖慢响应
+            max_tokens=50,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question},
@@ -502,19 +495,14 @@ def _describe_image(path: Path) -> str:
     if not api_key:
         return ""
     try:
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            timeout=40.0,
-            max_retries=1,
-        )
+        client = get_ai_client(api_key=api_key, timeout=40.0, max_retries=1)
         mime = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
         data_url = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
         resp = client.chat.completions.create(
             model=_vision_model(),
             temperature=0.1,
+            # 描述要求 100 字以内，300 tokens 绰绰有余，防模型偶尔长篇大论拖慢上传响应
+            max_tokens=300,
             messages=[
                 {"role": "system", "content": VISION_SYSTEM_PROMPT},
                 {
@@ -988,26 +976,6 @@ async def _process_question(
     # 后续检索/AI 判断统一用这个合并后的问题；打招呼、转人工这类"看客户原话"的判断仍用原文。
     query = _merge_image_into_question(question, image_descriptions)
 
-    # 与产品咨询完全无关的闲聊/荒谬提问（"吃饭了吗""这产品对国家安全有危害吗"之类）：不进人工
-    # 队列、不发邮件提醒，只在客户端展示一句引导语；但仍然完整落库（标记成 matched=True、附上
-    # "无关闲聊/非常规提问"这个说明，跟问候语的记录方式一致），方便管理员事后能在对话记录/刷新
-    # 恢复的聊天记录里都看到这条消息，同时也不会被误计入"转人工请求次数"这类统计。管理员可在
-    # 工作台随时关闭这个判断（一键退回"全部按正常问题处理"）。打招呼、明确要求转人工的都已在
-    # 上面单独处理，这里跳过，避免重复消耗一次 AI 调用、也避免被误判。
-    # 附带图片的提问跳过这个判断：客户特意拍照发过来，本身就说明有实际咨询需求，而"这个正常吗"
-    # 这类只看文字确实像无关闲聊的说法很容易被误判成"与产品无关"，把真实需求挡在门外。
-    if (
-        not is_greeting
-        and not is_explicit_transfer
-        and not has_image
-        and database.get_setting("skip_irrelevant_enabled", "true") == "true"
-    ):
-        if _is_irrelevant_question(question, product, model):
-            irrelevant_reply = _irrelevant_reply(product)
-            database.set_retrieval_info(conversation_id, True, "无关闲聊/非常规提问", irrelevant_reply, 1.0)
-            database.mark_answered(conversation_id, irrelevant_reply)
-            return AskResponse(conversation_id=conversation_id, status="answered", answer=irrelevant_reply, mode=mode)
-
     # 单纯打招呼（"你好""在吗"等，不带具体问题）：任何模式下都直接由 AI 回一句问候语并结束，
     # 不算"题库未命中"，不转人工、不发邮件提醒——避免客户每次只是打个招呼就惊动客服。
     # 附带图片时不走这条捷径：客户发了图再说一句"你好"，真正要问的是图片，不能只回一句问候语
@@ -1040,6 +1008,42 @@ async def _process_question(
             need_transfer_details=True,
         )
 
+    # ---- 无关闲聊判断 与 题库检索/AI 匹配 并行执行 ----
+    # 两者是相互独立的模型调用，串行等完要 2-4 秒。这里同时发起：主流程先等"无关闲聊"判断
+    # （要靠它决定这条消息走不走正常问答），判定无关时直接返回、检索那边的结果作废（多花
+    # 一次调用的钱，但无关问题占比很低）；判定相关时检索/匹配多半也已经跑完，总耗时约等于
+    # 两者中较慢的那个，而不是两者之和。asyncio.to_thread 同时把这些阻塞的同步调用挪出
+    # 事件循环，避免一个客户的提问把其他请求全卡住。
+    #
+    # 无关闲聊判断的行为与原来完全一致（详见 _classify_irrelevant 的说明）：命中时不进人工
+    # 队列、不发邮件，只回一句引导语，但仍完整落库（matched=True + "无关闲聊/非常规提问"），
+    # 管理员可用 skip_irrelevant_enabled 一键关闭。附带图片的提问跳过该判断（客户特意拍照
+    # 说明有真实需求，"这个正常吗"这类短文本很容易被误判）；打招呼、明确转人工已在上面返回。
+    irrelevant_task: Optional[asyncio.Task] = None
+    if not has_image and database.get_setting("skip_irrelevant_enabled", "true") == "true":
+        irrelevant_task = asyncio.create_task(
+            asyncio.to_thread(_is_irrelevant_question, question, product, model)
+        )
+
+    reply_task: Optional[asyncio.Task] = None
+    if mode in ("auto", "collab"):
+        reply_task = asyncio.create_task(asyncio.to_thread(_generate_ai_reply, product, query, model))
+
+    if irrelevant_task is not None:
+        irrelevant = False
+        try:
+            irrelevant = await irrelevant_task
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] 无关提问判断异常，按正常问题处理: {exc}", file=sys.stderr)
+        if irrelevant:
+            if reply_task is not None:
+                # 线程里的调用无法真正中断，只是不再等它的结果
+                reply_task.cancel()
+            irrelevant_reply = _irrelevant_reply(product)
+            database.set_retrieval_info(conversation_id, True, "无关闲聊/非常规提问", irrelevant_reply, 1.0)
+            database.mark_answered(conversation_id, irrelevant_reply)
+            return AskResponse(conversation_id=conversation_id, status="answered", answer=irrelevant_reply, mode=mode)
+
     # 未命中题库（包括该产品尚未建立题库的情况）时，任何模式都不允许 AI 直接回复或编造答案，
     # 统一转人工处理；只有确认命中题库时，才允许由 AI 直接回复（全AI模式）或生成建议（协同模式）。
     # 转人工不会立刻发邮件提醒客服：只有客户在"人工客服正忙"提示下主动留下邮箱后才会发邮件，
@@ -1051,7 +1055,7 @@ async def _process_question(
     if mode == "auto":
         result: Optional[AnswerResult] = None
         try:
-            result = _generate_ai_reply(product, query, model)
+            result = await reply_task
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 全AI模式生成回复失败: {exc}", file=sys.stderr)
 
@@ -1078,7 +1082,7 @@ async def _process_question(
 
     elif mode == "collab":
         try:
-            result = _generate_ai_reply(product, query, model)
+            result = await reply_task
             database.set_retrieval_info(
                 conversation_id,
                 result.matched,
@@ -1105,7 +1109,8 @@ async def _process_question(
             print(f"[warn] 协同模式生成AI建议失败: {exc}", file=sys.stderr)
             database.set_retrieval_info(conversation_id, False, None, None, 0.0)
     elif mode == "manual":
-        _log_retrieval_only(conversation_id, product, query)
+        # 检索标注涉及 embedding 网络调用，放线程里跑，别阻塞事件循环
+        await asyncio.to_thread(_log_retrieval_only, conversation_id, product, query)
 
     # 走到这里说明本次提问需要人工处理（全人工模式 / 协同或全AI模式下未命中题库）；
     # 只广播给工作台实时展示，不发邮件——邮件仅在客户主动留下邮箱后才发送。
