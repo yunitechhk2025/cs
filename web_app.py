@@ -1116,7 +1116,12 @@ def list_customer_session_history(session_id: str) -> dict:
                 "answer": item["final_answer"],
                 "status": item["status"],
                 "mode_used": item["mode_used"],
-                "matched": bool(item["matched"]),
+                # 客户端只关心"AI 会不会自己回"（决定刷新后显示"AI 思考中"还是"转人工"等待）。
+                # 数据库里的 matched 是题库是否命中，与之并不等价：命中但置信度低于阈值的对话
+                # 不会自动发送、需要人工处理（status=pending 且没有 auto_send_at），刷新恢复时
+                # 必须按"转人工"展示，否则客户会一直卡在"AI 正在思考"、留邮箱提示也不会出现。
+                "matched": bool(item["matched"])
+                and (item["status"] != "pending" or bool(item["auto_send_at"])),
                 "has_email": bool(item["customer_email"]),
                 "email": item["customer_email"] or None,
                 "awaiting_transfer_details": bool(item["awaiting_transfer_details"]),
