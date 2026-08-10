@@ -1016,8 +1016,9 @@
         <div id="admin-confidence-section" style="display: none;">
           <h4>AI 自动回复置信度阈值</h4>
           <p style="font-size: 12px; color: #94a1b8; margin: 0 0 10px; line-height: 1.6;">
-            题库命中后，只有 AI 的置信度达到该阈值，全AI模式才会直接回复客户、人机协同模式才会启动自动发送倒计时；
-            低于阈值一律转人工处理，AI 生成的回复会保留为建议草稿供客服采纳或改写。设为 0 表示不启用（命中即自动回复）。
+            题库命中后，只有<strong>综合置信度</strong>（AI 自评把握 ×0.6 + 检索相似度 ×0.4，即消息卡片上显示的那个综合值）达到该阈值，
+            全AI模式才会直接回复客户、人机协同模式才会启动自动发送倒计时；低于阈值一律转人工处理，AI
+            生成的回复会保留为建议草稿供客服采纳或改写。设为 0 表示不启用（命中即自动回复）。
           </p>
           <div style="display: flex; gap: 8px; align-items: center;">
             <input
