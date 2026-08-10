@@ -737,9 +737,12 @@ def _log_retrieval_only(conversation_id: int, product: str, question: str) -> No
             detailed = product_bot.retrieve_detailed(question)
             if detailed and detailed[0]["score"] >= product_bot.min_score:
                 best = detailed[0]
-                evidence = retrieval_evidence(best["lexical"], best["semantic"], best["in_both"])
+                evidence = round(
+                    retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4
+                )
                 database.set_retrieval_info(
-                    conversation_id, True, best["item"].question, best["item"].answer, round(evidence, 4)
+                    conversation_id, True, best["item"].question, best["item"].answer, evidence,
+                    retrieval_evidence=evidence,
                 )
             else:
                 miss_evidence = (
@@ -752,7 +755,9 @@ def _log_retrieval_only(conversation_id: int, product: str, question: str) -> No
                     if detailed
                     else 0.0
                 )
-                database.set_retrieval_info(conversation_id, False, None, None, miss_evidence)
+                database.set_retrieval_info(
+                    conversation_id, False, None, None, miss_evidence, retrieval_evidence=miss_evidence
+                )
             return
         # 文档题库（DocRagBot）等没有 retrieve_detailed 的检索器：沿用原始综合分。
         # 文档条目是 DocChunk（title/text），没有 question/answer 字段，做一层兼容。
@@ -1052,7 +1057,8 @@ async def _process_question(
 
         if result is not None and result.matched:
             database.set_retrieval_info(
-                conversation_id, True, result.matched_question, result.matched_answer, result.confidence
+                conversation_id, True, result.matched_question, result.matched_answer, result.confidence,
+                ai_confidence=result.ai_confidence, retrieval_evidence=result.evidence,
             )
             if result.confidence >= _min_confidence_threshold():
                 database.mark_answered(conversation_id, result.text)
@@ -1065,7 +1071,9 @@ async def _process_question(
         else:
             # 未命中也记录（最高候选的）置信度，工作台跟"未找到匹配内容"一起展示，供调阈值参考
             database.set_retrieval_info(
-                conversation_id, False, None, None, result.confidence if result is not None else 0.0
+                conversation_id, False, None, None,
+                result.confidence if result is not None else 0.0,
+                retrieval_evidence=result.evidence if result is not None else None,
             )
 
     elif mode == "collab":
@@ -1077,6 +1085,8 @@ async def _process_question(
                 result.matched_question,
                 result.matched_answer,
                 result.confidence,
+                ai_confidence=result.ai_confidence,
+                retrieval_evidence=result.evidence,
             )
             if result.matched:
                 database.set_ai_suggestion(conversation_id, result.text, result.confidence)

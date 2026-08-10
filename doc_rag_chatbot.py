@@ -262,7 +262,8 @@ class DocRagBot:
         miss_confidence = round(max(calibrate_lexical(best_score), calibrate_semantic(best_score)), 4)
         if best_score < self.min_score:
             return AnswerResult(
-                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+                text=self._not_found_text(), matched=False, score=best_score,
+                confidence=miss_confidence, evidence=miss_confidence,
             )
 
         try:
@@ -272,12 +273,14 @@ class DocRagBot:
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 文档RAG生成回复失败: {exc}", file=sys.stderr)
             return AnswerResult(
-                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+                text=self._not_found_text(), matched=False, score=best_score,
+                confidence=miss_confidence, evidence=miss_confidence,
             )
 
         if not raw_answer or NO_ANSWER_TOKEN in raw_answer:
             return AnswerResult(
-                text=self._not_found_text(), matched=False, score=best_score, confidence=miss_confidence
+                text=self._not_found_text(), matched=False, score=best_score,
+                confidence=miss_confidence, evidence=miss_confidence,
             )
 
         matched_titles = "、".join(item.title for _, item in ranked if _ >= self.min_score * 0.6)
@@ -285,7 +288,7 @@ class DocRagBot:
         # 文档 RAG 的"能否作答"由生成时的严格判断把关（资料没明确涉及就输出 NO_ANSWER_TOKEN），
         # 走到这里说明 AI 已确认资料能回答，给 0.5 的基础置信度，再按检索证据往上加；
         # ranked 里只有两路取较大值后的综合分，无法区分来自哪一路，取两种校准的较大值近似。
-        evidence = max(calibrate_lexical(best_score), calibrate_semantic(best_score))
+        evidence = round(max(calibrate_lexical(best_score), calibrate_semantic(best_score)), 4)
         confidence = round(min(0.99, 0.5 + 0.5 * evidence), 4)
         return AnswerResult(
             text=raw_answer,
@@ -294,4 +297,5 @@ class DocRagBot:
             matched_question=matched_titles or ranked[0][1].title,
             matched_answer=matched_texts or ranked[0][1].text,
             confidence=confidence,
+            evidence=evidence,
         )

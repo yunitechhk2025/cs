@@ -1817,10 +1817,16 @@
             </div>`;
         }
         if (item.matched === 1) {
+          // 括号里把综合置信度和它的两个分量一起亮出来：综合值 = AI 自评 ×0.6 + 检索相似度 ×0.4，
+          // 与阈值比较的是综合值。老数据/AI 未参与的场景没有分量数据，只显示综合值。
           const scoreText = typeof item.match_score === "number" ? `${(item.match_score * 100).toFixed(0)}%` : "-";
+          const confParts = [];
+          if (typeof item.ai_confidence === "number") confParts.push(`AI 自评 ${(item.ai_confidence * 100).toFixed(0)}%`);
+          if (typeof item.retrieval_evidence === "number") confParts.push(`检索相似度 ${(item.retrieval_evidence * 100).toFixed(0)}%`);
+          const confDetail = confParts.length ? `，${confParts.join("，")}` : "";
           return `
             <div class="intent-wrap">
-              <span class="intent-badge hit">✨ AI 识别：命中相关资料（置信度 ${scoreText}）</span>
+              <span class="intent-badge hit">✨ AI 识别：命中相关资料（综合置信度 ${scoreText}${confDetail}）</span>
               <div class="msg-badges">${badgesHtml}</div>
               <div class="intent-card">
                 <div class="q">${escapeHtml(item.matched_question || "")}</div>

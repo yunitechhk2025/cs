@@ -42,6 +42,11 @@ class AnswerResult:
     # 供工作台展示和"低于阈值不允许 AI 自动回复"的决策使用。score 仍是原始检索分（两路取
     # 较大值，不同路尺度不同、不可比），只保留作诊断参考。
     confidence: float = 0.0
+    # 置信度的两个分量，工作台拆开展示用：
+    # ai_confidence：AI 语义判断的自评把握（0-1）；AI 未参与/调用失败/判定不匹配时为 None。
+    # evidence：两路检索校准后的证据分（0-1）；未命中时是最高候选的证据分。
+    ai_confidence: Optional[float] = None
+    evidence: Optional[float] = None
 
 
 def _clamp01(value: float) -> float:
@@ -464,30 +469,34 @@ class ExcelFaqRagBot:
                     matched_question=item.question,
                     matched_answer=item.answer,
                     confidence=confidence,
+                    ai_confidence=round(ai_confidence, 4) if ai_confidence is not None else None,
+                    evidence=round(evidence, 4),
                 )
             # AI 判定所有候选都不匹配：置信度记录检索最高候选的证据分（校准后 0-1 尺度），
             # 工作台把它跟"未找到匹配内容"一起展示，方便管理员观察分布、决定阈值调多少。
             top = detailed[0]
+            miss_evidence = round(retrieval_evidence(top["lexical"], top["semantic"], top["in_both"]), 4)
             return AnswerResult(
                 text=self._not_found_text(),
                 matched=False,
                 score=ranked[0][0],
-                confidence=round(retrieval_evidence(top["lexical"], top["semantic"], top["in_both"]), 4),
+                confidence=miss_evidence,
+                evidence=miss_evidence,
             )
 
         # AI 调用异常时的兜底：仅依赖关键词检索分数；没有 AI 判断背书，置信度按检索证据打对折
         best = detailed[0]
         best_score, best_item = best["score"], best["item"]
+        best_evidence = round(retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4)
         if best_score < self.min_score:
             return AnswerResult(
                 text=self._not_found_text(),
                 matched=False,
                 score=best_score,
-                confidence=round(retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4),
+                confidence=best_evidence,
+                evidence=best_evidence,
             )
-        fallback_confidence = round(
-            0.5 * retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4
-        )
+        fallback_confidence = round(0.5 * best_evidence, 4)
         text = f"亲，为您查询到以下官方说明：\n{best_item.answer}"
         return AnswerResult(
             text=text,
@@ -496,6 +505,7 @@ class ExcelFaqRagBot:
             matched_question=best_item.question,
             matched_answer=best_item.answer,
             confidence=fallback_confidence,
+            evidence=best_evidence,
         )
 
 

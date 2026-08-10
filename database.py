@@ -160,6 +160,12 @@ def init_db() -> None:
         # （已并进本次提问一起检索），客服在工作台能看到 AI 到底"看见了什么"，便于复核。
         _add_column_if_missing(conn, "conversations", "image_url", "TEXT")
         _add_column_if_missing(conn, "conversations", "image_description", "TEXT")
+        # 置信度的两个分量（match_score 存的是融合后的综合置信度）：工作台把它们拆开展示，
+        # 让客服/管理员看清"AI 自己有多大把握"和"检索证据有多强"分别是多少。
+        # ai_confidence：AI 语义判断的自评把握（0-1，未命中/AI 调用失败时为 NULL）。
+        # retrieval_evidence：两路检索校准后的证据分（0-1）。
+        _add_column_if_missing(conn, "conversations", "ai_confidence", "REAL")
+        _add_column_if_missing(conn, "conversations", "retrieval_evidence", "REAL")
 
         row = conn.execute("SELECT value FROM settings WHERE key = 'global_mode'").fetchone()
         if row is None:
@@ -268,17 +274,30 @@ def set_retrieval_info(
     matched_question: Optional[str],
     matched_answer: Optional[str],
     score: float,
+    ai_confidence: Optional[float] = None,
+    retrieval_evidence: Optional[float] = None,
 ) -> None:
-    """记录本次提问在题库中的检索结果：命中的问题/答案，或未命中。"""
+    """记录本次提问在题库中的检索结果：命中的问题/答案，或未命中。
+    score 是融合后的综合置信度；ai_confidence / retrieval_evidence 是它的两个分量，
+    工作台拆开展示用（没有对应数据的场景传 None 即可）。"""
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE conversations
             SET matched = ?, matched_question = ?, matched_answer = ?, match_score = ?,
+                ai_confidence = ?, retrieval_evidence = ?,
                 updated_at = datetime('now')
             WHERE id = ?
             """,
-            (1 if matched else 0, matched_question, matched_answer, score, conversation_id),
+            (
+                1 if matched else 0,
+                matched_question,
+                matched_answer,
+                score,
+                ai_confidence,
+                retrieval_evidence,
+                conversation_id,
+            ),
         )
 
 
