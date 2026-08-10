@@ -1829,10 +1829,12 @@
             </div>`;
         }
         if (item.matched === 0) {
-          // 未命中也展示置信度（检索最高候选的证据分）：低于阈值被拦下来的对话和真正
-          // 无关的对话都在这里，管理员靠这个数字观察分布、决定阈值该调高还是调低。
+          // 未命中时展示的是"检索最高候选的相似度证据"，不是命中时那个含 AI 自评的置信度：
+          // AI 语义裁决已判定所有候选都不匹配（不匹配一律转人工，与阈值无关），这个数字只说明
+          // "题库里字面/语义最接近的那条有多像"，供管理员复核 AI 的拒判是否合理、观察分布调阈值。
+          // 文案特意不用"置信度"，避免出现"置信度 89% 为什么还转人工"的误读。
           const missScoreText =
-            typeof item.match_score === "number" ? `（置信度 ${(item.match_score * 100).toFixed(0)}%）` : "";
+            typeof item.match_score === "number" ? `（最高候选相似度 ${(item.match_score * 100).toFixed(0)}%）` : "";
           return `
             <div class="intent-wrap">
               <span class="intent-badge miss">⚠️ AI 识别：未找到匹配内容${missScoreText}</span>
