@@ -33,7 +33,7 @@ import whatsapp
 from auth import create_token, decode_token, get_current_agent, require_admin
 from doc_rag_chatbot import DocRagBot
 from email_utils import DEFAULT_NOTIFY_EMAIL_TO, send_email, send_test_email
-from excel_rag_chatbot import AnswerResult, ExcelFaqRagBot
+from excel_rag_chatbot import AnswerResult, ExcelFaqRagBot, retrieval_evidence
 from ws_manager import manager
 
 DEFAULT_EXCEL = "2026.01.26_肤润康-常见咨询问题_v2(1).xls"
@@ -44,6 +44,10 @@ BRAND_NAME = "YUNI"
 VALID_MODES = {"auto", "manual", "collab"}
 MODE_LABELS = {"auto": "全AI模式", "manual": "全人工模式", "collab": "人机协同模式"}
 DEFAULT_COLLAB_AUTO_SEND_SECONDS = 5
+# AI 自动回复的置信度阈值（百分比）：题库命中后，只有置信度达到阈值，全AI模式才会直接回复
+# 客户、协同模式才会安排自动发送倒计时；低于阈值一律转人工，AI 草稿保留给客服参考。
+# 管理员可在工作台设置里调整，设为 0 表示不启用这道门槛（回到"命中即自动回复"的旧行为）。
+DEFAULT_MIN_CONFIDENCE_PERCENT = 70
 AUTO_SEND_AGENT_NAME = "AI自动发送"
 DEFAULT_REMINDER_INTERVAL_MINUTES = 30
 REMINDER_TICK_SECONDS = 30
@@ -101,6 +105,10 @@ class ModeRequest(BaseModel):
 
 class CollabTimeoutRequest(BaseModel):
     seconds: float
+
+
+class MinConfidenceRequest(BaseModel):
+    percent: float
 
 
 class ReminderSettingsRequest(BaseModel):
@@ -717,16 +725,35 @@ async def _daily_report_loop() -> None:
 
 
 def _log_retrieval_only(conversation_id: int, product: str, question: str) -> None:
-    """全人工模式下不调用 AI 生成回复，但仍在后台记录题库检索结果，便于客服复核。"""
+    """全人工模式下不调用 AI 生成回复，但仍在后台记录题库检索结果，便于客服复核。
+    这里没有 AI 语义判断，标注里的置信度只有"检索证据"这一部分（校准到与其他模式相同的
+    0-1 尺度），供客服参考。"""
     product_bot = bots.get(product)
     if product_bot is None:
         database.set_retrieval_info(conversation_id, False, None, None, 0.0)
         return
     try:
+        if hasattr(product_bot, "retrieve_detailed"):
+            detailed = product_bot.retrieve_detailed(question)
+            if detailed and detailed[0]["score"] >= product_bot.min_score:
+                best = detailed[0]
+                evidence = retrieval_evidence(best["lexical"], best["semantic"], best["in_both"])
+                database.set_retrieval_info(
+                    conversation_id, True, best["item"].question, best["item"].answer, round(evidence, 4)
+                )
+            else:
+                database.set_retrieval_info(
+                    conversation_id, False, None, None, detailed[0]["score"] if detailed else 0.0
+                )
+            return
+        # 文档题库（DocRagBot）等没有 retrieve_detailed 的检索器：沿用原始综合分。
+        # 文档条目是 DocChunk（title/text），没有 question/answer 字段，做一层兼容。
         ranked = product_bot.retrieve(question)
         if ranked and ranked[0][0] >= product_bot.min_score:
             score, item = ranked[0]
-            database.set_retrieval_info(conversation_id, True, item.question, item.answer, score)
+            q_text = getattr(item, "question", None) or getattr(item, "title", "")
+            a_text = getattr(item, "answer", None) or getattr(item, "text", "")
+            database.set_retrieval_info(conversation_id, True, q_text, a_text, score)
         else:
             database.set_retrieval_info(conversation_id, False, None, None, ranked[0][0] if ranked else 0.0)
     except Exception as exc:  # noqa: BLE001
@@ -761,6 +788,30 @@ def set_collab_timeout(req: CollabTimeoutRequest, agent: dict = Depends(require_
         raise HTTPException(status_code=400, detail="超时时间需在 1-300 秒之间")
     database.set_setting("collab_auto_send_seconds", str(req.seconds))
     return {"seconds": req.seconds}
+
+
+def _min_confidence_threshold() -> float:
+    """AI 自动回复所需的最低置信度（0-1）。后台设置的是百分比，这里换算并做健壮性兜底。"""
+    try:
+        percent = float(
+            database.get_setting("min_confidence_percent", str(DEFAULT_MIN_CONFIDENCE_PERCENT))
+        )
+    except (TypeError, ValueError):
+        percent = DEFAULT_MIN_CONFIDENCE_PERCENT
+    return max(0.0, min(100.0, percent)) / 100.0
+
+
+@app.get("/api/min-confidence")
+def get_min_confidence() -> dict:
+    return {"percent": round(_min_confidence_threshold() * 100, 1)}
+
+
+@app.post("/api/min-confidence")
+def set_min_confidence(req: MinConfidenceRequest, agent: dict = Depends(require_admin)) -> dict:
+    if req.percent < 0 or req.percent > 100:
+        raise HTTPException(status_code=400, detail="置信度阈值需在 0-100 之间")
+    database.set_setting("min_confidence_percent", str(req.percent))
+    return {"percent": req.percent}
 
 
 # ---------------- SMTP 发信配置（后台可配置，优先于 .env 里的 SMTP_*） ----------------
@@ -993,30 +1044,43 @@ async def _process_question(
 
         if result is not None and result.matched:
             database.set_retrieval_info(
-                conversation_id, True, result.matched_question, result.matched_answer, result.score
+                conversation_id, True, result.matched_question, result.matched_answer, result.confidence
             )
-            database.mark_answered(conversation_id, result.text)
-            return AskResponse(conversation_id=conversation_id, status="answered", answer=result.text, mode=mode)
-
-        database.set_retrieval_info(
-            conversation_id, False, None, None, result.score if result is not None else 0.0
-        )
+            if result.confidence >= _min_confidence_threshold():
+                database.mark_answered(conversation_id, result.text)
+                return AskResponse(
+                    conversation_id=conversation_id, status="answered", answer=result.text, mode=mode
+                )
+            # 命中题库但置信度低于阈值：不允许 AI 直接回复，转人工处理；AI 生成的回复
+            # 存成建议草稿，客服在工作台一键采纳或改写后发送，不会自动发送。
+            database.set_ai_suggestion(conversation_id, result.text, result.confidence)
+        else:
+            database.set_retrieval_info(
+                conversation_id, False, None, None, result.score if result is not None else 0.0
+            )
 
     elif mode == "collab":
         try:
             result = _generate_ai_reply(product, query, model)
             database.set_retrieval_info(
-                conversation_id, result.matched, result.matched_question, result.matched_answer, result.score
+                conversation_id,
+                result.matched,
+                result.matched_question,
+                result.matched_answer,
+                result.confidence if result.matched else result.score,
             )
             if result.matched:
-                database.set_ai_suggestion(conversation_id, result.text, result.score)
-                timeout = float(
-                    database.get_setting("collab_auto_send_seconds", str(DEFAULT_COLLAB_AUTO_SEND_SECONDS))
-                )
-                auto_send_at = (datetime.utcnow() + timedelta(seconds=timeout)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                database.set_auto_send_at(conversation_id, auto_send_at)
-                asyncio.create_task(_auto_send_after_timeout(conversation_id, result.text, timeout))
-                pending_matched = True
+                database.set_ai_suggestion(conversation_id, result.text, result.confidence)
+                if result.confidence >= _min_confidence_threshold():
+                    timeout = float(
+                        database.get_setting("collab_auto_send_seconds", str(DEFAULT_COLLAB_AUTO_SEND_SECONDS))
+                    )
+                    auto_send_at = (datetime.utcnow() + timedelta(seconds=timeout)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    database.set_auto_send_at(conversation_id, auto_send_at)
+                    asyncio.create_task(_auto_send_after_timeout(conversation_id, result.text, timeout))
+                    pending_matched = True
+                # 命中但置信度低于阈值：AI 建议保留给客服参考，但不安排自动发送，
+                # 必须由客服确认/改写后手动发送（客户端按转人工的等待流程处理）。
             # 未命中：不生成 AI 建议、不安排自动发送，完全交给客服人工处理
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] 协同模式生成AI建议失败: {exc}", file=sys.stderr)

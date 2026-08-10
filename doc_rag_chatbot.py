@@ -19,7 +19,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from excel_rag_chatbot import AnswerResult
+from excel_rag_chatbot import AnswerResult, calibrate_lexical, calibrate_semantic
 from kb_desensitize import desensitize
 
 NO_ANSWER_TOKEN = "NO_ANSWER"
@@ -274,10 +274,16 @@ class DocRagBot:
 
         matched_titles = "、".join(item.title for _, item in ranked if _ >= self.min_score * 0.6)
         matched_texts = "\n\n".join(item.text for _, item in ranked if _ >= self.min_score * 0.6)
+        # 文档 RAG 的"能否作答"由生成时的严格判断把关（资料没明确涉及就输出 NO_ANSWER_TOKEN），
+        # 走到这里说明 AI 已确认资料能回答，给 0.5 的基础置信度，再按检索证据往上加；
+        # ranked 里只有两路取较大值后的综合分，无法区分来自哪一路，取两种校准的较大值近似。
+        evidence = max(calibrate_lexical(best_score), calibrate_semantic(best_score))
+        confidence = round(min(0.99, 0.5 + 0.5 * evidence), 4)
         return AnswerResult(
             text=raw_answer,
             matched=True,
             score=best_score,
             matched_question=matched_titles or ranked[0][1].title,
             matched_answer=matched_texts or ranked[0][1].text,
+            confidence=confidence,
         )

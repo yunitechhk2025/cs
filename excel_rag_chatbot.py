@@ -38,6 +38,39 @@ class AnswerResult:
     score: float
     matched_question: Optional[str] = None
     matched_answer: Optional[str] = None
+    # 校准后的置信度（0-1）：由"检索证据"与"AI 语义判断的自评把握"融合而来，跨问题可比，
+    # 供工作台展示和"低于阈值不允许 AI 自动回复"的决策使用。score 仍是原始检索分（两路取
+    # 较大值，不同路尺度不同、不可比），只保留作诊断参考。
+    confidence: float = 0.0
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def calibrate_lexical(score: float) -> float:
+    """把关键词分（TF-IDF 余弦 + 0.25×字符重合加成，实际范围大约 0~0.9）映射到 0-1。
+    0.6 以上在真实题库问答里已经是"几乎原句复述"的水平，直接封顶为 1。"""
+    return _clamp01(score / 0.60)
+
+
+def calibrate_semantic(score: float) -> float:
+    """把 embedding 余弦相似度映射到 0-1。文本 embedding 的余弦有"下限很高"的特点：
+    完全无关的两句话也常有 0.2~0.35，所以 0.35 以下按 0 处理；0.75 以上在同义改写问句上
+    已经非常可靠，封顶为 1。"""
+    return _clamp01((score - 0.35) / 0.40)
+
+
+def retrieval_evidence(lexical: float, semantic: Optional[float], in_both: bool = False) -> float:
+    """综合两路检索给出 0-1 的"检索证据"分：两路各自校准到同一尺度后取较大值；
+    如果该条目同时进入了关键词和语义两路的 top-k（两种完全不同的检索方式都认为它相关），
+    再小幅加分。这是置信度里"客观证据"的部分，与 AI 判断的自评把握融合成最终置信度。"""
+    evidence = calibrate_lexical(lexical)
+    if semantic is not None:
+        evidence = max(evidence, calibrate_semantic(semantic))
+    if in_both:
+        evidence = min(1.0, evidence + 0.10)
+    return evidence
 
 
 class ExcelFaqRagBot:
@@ -242,9 +275,13 @@ class ExcelFaqRagBot:
         print(f"[warn] 语义检索调用失败（已重试{attempts}次），本次仅使用关键词检索: {last_exc}", file=sys.stderr)
         return None
 
-    def retrieve(
+    def retrieve_detailed(
         self, user_query: str, base_url: Optional[str] = None, api_key: Optional[str] = None
-    ) -> List[Tuple[float, FaqItem]]:
+    ) -> List[dict]:
+        """检索并保留每条候选的两路原始分数（供置信度计算用）。
+        返回按综合分降序排列的字典列表：
+        item / score（两路取较大值的综合分）/ lexical / semantic（语义检索失败时为 None）/
+        in_both（是否同时进入两路各自的 top-k）。"""
         if self.doc_vectors is None:
             raise RuntimeError("索引尚未构建，请先执行 build_index()。")
 
@@ -269,9 +306,12 @@ class ExcelFaqRagBot:
         k = min(self.top_k, n)
         lexical_top_idx = sorted(range(n), key=lambda i: lexical_scores[i], reverse=True)[:k]
         candidate_idx = set(lexical_top_idx)
+        semantic_top_set: set = set()
         if semantic_scores is not None:
             semantic_top_idx = sorted(range(n), key=lambda i: semantic_scores[i], reverse=True)[:k]
+            semantic_top_set = set(semantic_top_idx)
             candidate_idx.update(semantic_top_idx)
+        lexical_top_set = set(lexical_top_idx)
 
         def combined_score(i: int) -> float:
             score = float(lexical_scores[i])
@@ -279,12 +319,26 @@ class ExcelFaqRagBot:
                 score = max(score, float(semantic_scores[i]))
             return score
 
-        ranked = sorted(
-            [(combined_score(i), self.items[i]) for i in candidate_idx],
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        return ranked
+        entries = [
+            {
+                "item": self.items[i],
+                "score": combined_score(i),
+                "lexical": float(lexical_scores[i]),
+                "semantic": float(semantic_scores[i]) if semantic_scores is not None else None,
+                "in_both": i in lexical_top_set and i in semantic_top_set,
+            }
+            for i in candidate_idx
+        ]
+        entries.sort(key=lambda e: e["score"], reverse=True)
+        return entries
+
+    def retrieve(
+        self, user_query: str, base_url: Optional[str] = None, api_key: Optional[str] = None
+    ) -> List[Tuple[float, FaqItem]]:
+        return [
+            (entry["score"], entry["item"])
+            for entry in self.retrieve_detailed(user_query, base_url=base_url, api_key=api_key)
+        ]
 
     def _not_found_text(self) -> str:
         return (
@@ -299,12 +353,12 @@ class ExcelFaqRagBot:
         model: str,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-    ) -> Tuple[int, str]:
+    ) -> Tuple[int, str, Optional[float]]:
         """让 AI 在关键词检索出的候选题库问题中做语义匹配（允许措辞、语序、同义表达不同，
         只要客户意图与某条候选实质相同即可），并生成引出官方说明的开场白。
         绝不让 AI 生成或复述专业内容本身，专业内容始终由调用方原文拼接，确保逐字一致。
 
-        返回 (候选序号, 开场白)；序号为 0 表示 AI 判断所有候选都不匹配。
+        返回 (候选序号, 开场白, AI 自评把握 0-1 或 None)；序号为 0 表示 AI 判断所有候选都不匹配。
         """
         candidates = "\n".join(f"{i}. {item.question}" for i, (_, item) in enumerate(ranked, start=1))
         system_prompt = (
@@ -315,9 +369,14 @@ class ExcelFaqRagBot:
             "2. 如果确实匹配到某一条，生成一句简短亲切、口语化的开场白/过渡语（不超过20个字），"
             "用于引出接下来将原文展示的官方说明；开场白中严禁提及、复述或猜测任何成分、功效、用法用量、"
             "禁忌等专业内容，那部分会在开场白之后原文附加，不需要你生成。\n"
-            "3. 如果没有任何一条候选真正匹配客户的意图，index 填 0，greeting 填空字符串。\n"
-            "4. 只输出如下格式的 JSON，不要输出任何多余文字、解释或代码块标记：\n"
-            '{"index": 数字, "greeting": "字符串"}'
+            "3. confidence 填 0-100 的整数，表示你对「客户意图与所选候选实质相同」的把握：\n"
+            "   90-100：意图明确一致，几乎可以肯定；\n"
+            "   70-89：比较有把握，措辞不同但意图清晰对应；\n"
+            "   50-69：意图大致相同，但客户表述含糊或存在多种理解；\n"
+            "   50 以下：只是勉强相关，不确定客户真正想问的是不是这件事。\n"
+            "4. 如果没有任何一条候选真正匹配客户的意图，index 填 0，greeting 填空字符串，confidence 填 0。\n"
+            "5. 只输出如下格式的 JSON，不要输出任何多余文字、解释或代码块标记：\n"
+            '{"index": 数字, "greeting": "字符串", "confidence": 数字}'
         )
         user_prompt = f"客户问题：{user_query}\n\n候选题库问题：\n{candidates}"
 
@@ -334,18 +393,25 @@ class ExcelFaqRagBot:
 
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            return 0, ""
+            return 0, "", None
         try:
             payload = json.loads(match.group())
         except json.JSONDecodeError:
-            return 0, ""
+            return 0, "", None
 
         try:
             idx = int(payload.get("index", 0) or 0)
         except (TypeError, ValueError):
             idx = 0
         greeting = str(payload.get("greeting", "") or "").strip()
-        return idx, greeting
+        ai_confidence: Optional[float] = None
+        try:
+            raw_conf = payload.get("confidence")
+            if raw_conf is not None:
+                ai_confidence = _clamp01(float(raw_conf) / 100.0)
+        except (TypeError, ValueError):
+            ai_confidence = None
+        return idx, greeting, ai_confidence
 
     def answer(
         self,
@@ -354,11 +420,12 @@ class ExcelFaqRagBot:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> AnswerResult:
-        ranked = self.retrieve(user_query, base_url=base_url, api_key=api_key)
-        if not ranked:
+        detailed = self.retrieve_detailed(user_query, base_url=base_url, api_key=api_key)
+        if not detailed:
             return AnswerResult(text="抱歉，题库为空或尚未建立索引。", matched=False, score=0.0)
+        ranked = [(entry["score"], entry["item"]) for entry in detailed]
 
-        selection: Optional[Tuple[int, str]] = None
+        selection: Optional[Tuple[int, str, Optional[float]]] = None
         try:
             # 始终把候选交给 AI 做语义判断，不因关键词分数偏低而提前拒判，
             # 这样措辞不同但意思相同的相似问题也能命中题库答案。
@@ -373,9 +440,19 @@ class ExcelFaqRagBot:
             print(f"[warn] AI 语义匹配失败，已回退到关键词检索结果: {exc}", file=sys.stderr)
 
         if selection is not None:
-            idx, greeting = selection
+            idx, greeting, ai_confidence = selection
             if idx and 1 <= idx <= len(ranked):
-                score, item = ranked[idx - 1]
+                entry = detailed[idx - 1]
+                item = entry["item"]
+                # 最终置信度 = AI 自评把握（主）与检索证据（辅）的加权融合：AI 是最终裁决者，
+                # 权重更高；检索证据是独立的客观信号，用来抑制 AI 对短文本/含糊问句过度自信
+                # （"你是傻子"误判 100% 那类 bug 的场景下，两路检索证据都会很低，把总分拉下来）。
+                evidence = retrieval_evidence(entry["lexical"], entry["semantic"], entry["in_both"])
+                if ai_confidence is None:
+                    confidence = evidence
+                else:
+                    confidence = 0.6 * ai_confidence + 0.4 * evidence
+                confidence = round(_clamp01(confidence), 4)
                 if not greeting:
                     greeting = "亲，为您查询到以下官方说明："
                 # 专业内容始终是题库原文的直接拼接，不经过 AI 改写，确保逐字一致
@@ -383,16 +460,21 @@ class ExcelFaqRagBot:
                 return AnswerResult(
                     text=text,
                     matched=True,
-                    score=score,
+                    score=entry["score"],
                     matched_question=item.question,
                     matched_answer=item.answer,
+                    confidence=confidence,
                 )
             return AnswerResult(text=self._not_found_text(), matched=False, score=ranked[0][0])
 
-        # AI 调用异常时的兜底：仅依赖关键词检索分数
-        best_score, best_item = ranked[0]
+        # AI 调用异常时的兜底：仅依赖关键词检索分数；没有 AI 判断背书，置信度按检索证据打对折
+        best = detailed[0]
+        best_score, best_item = best["score"], best["item"]
         if best_score < self.min_score:
             return AnswerResult(text=self._not_found_text(), matched=False, score=best_score)
+        fallback_confidence = round(
+            0.5 * retrieval_evidence(best["lexical"], best["semantic"], best["in_both"]), 4
+        )
         text = f"亲，为您查询到以下官方说明：\n{best_item.answer}"
         return AnswerResult(
             text=text,
@@ -400,6 +482,7 @@ class ExcelFaqRagBot:
             score=best_score,
             matched_question=best_item.question,
             matched_answer=best_item.answer,
+            confidence=fallback_confidence,
         )
 
 

@@ -1013,6 +1013,25 @@
           </div>
         </div>
 
+        <div id="admin-confidence-section" style="display: none;">
+          <h4>AI 自动回复置信度阈值</h4>
+          <p style="font-size: 12px; color: #94a1b8; margin: 0 0 10px; line-height: 1.6;">
+            题库命中后，只有 AI 的置信度达到该阈值，全AI模式才会直接回复客户、人机协同模式才会启动自动发送倒计时；
+            低于阈值一律转人工处理，AI 生成的回复会保留为建议草稿供客服采纳或改写。设为 0 表示不启用（命中即自动回复）。
+          </p>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input
+              id="min-confidence-input"
+              type="number"
+              min="0"
+              max="100"
+              style="width: 100px; padding: 9px 10px; border: 1px solid #d7dfec; border-radius: 8px; font-size: 13px;"
+            />
+            <span style="font-size: 13px; color: #6b7686;">%</span>
+            <button class="btn btn-primary" id="save-confidence-btn">保存</button>
+          </div>
+        </div>
+
         <div id="admin-smtp-section" style="display: none;">
           <h4>SMTP 发信配置</h4>
           <p style="font-size: 12px; color: #94a1b8; margin: 0 0 10px; line-height: 1.6;">
@@ -1150,6 +1169,9 @@
       const adminTimeoutSection = document.getElementById("admin-timeout-section");
       const collabTimeoutInput = document.getElementById("collab-timeout-input");
       const saveTimeoutBtn = document.getElementById("save-timeout-btn");
+      const adminConfidenceSection = document.getElementById("admin-confidence-section");
+      const minConfidenceInput = document.getElementById("min-confidence-input");
+      const saveConfidenceBtn = document.getElementById("save-confidence-btn");
       const adminSmtpSection = document.getElementById("admin-smtp-section");
       const smtpHostInput = document.getElementById("smtp-host-input");
       const smtpPortInput = document.getElementById("smtp-port-input");
@@ -1331,6 +1353,7 @@
         whoName.textContent = `🎧 ${agent.displayName}（${agent.role === "admin" ? "管理员" : "客服"}）`;
         adminAgentsSection.style.display = agent.role === "admin" ? "block" : "none";
         adminTimeoutSection.style.display = agent.role === "admin" ? "block" : "none";
+        adminConfidenceSection.style.display = agent.role === "admin" ? "block" : "none";
         adminReminderSection.style.display = agent.role === "admin" ? "block" : "none";
         adminDailyReportSection.style.display = agent.role === "admin" ? "block" : "none";
         adminIrrelevantSection.style.display = agent.role === "admin" ? "block" : "none";
@@ -1342,6 +1365,7 @@
         if (agent.role === "admin") {
           refreshAgents();
           refreshCollabTimeout();
+          refreshMinConfidence();
           refreshReminderSettings();
           refreshDailyReportSettings();
           refreshIrrelevantFilterSettings();
@@ -1432,6 +1456,31 @@
         try {
           await apiFetch("/api/collab-timeout", { method: "POST", body: JSON.stringify({ seconds }) });
           showToast("已保存自动发送时间设置");
+        } catch (err) {
+          showToast(err.message);
+        }
+      });
+
+      // ---------------- AI 自动回复置信度阈值 ----------------
+
+      async function refreshMinConfidence() {
+        try {
+          const data = await apiFetch("/api/min-confidence");
+          minConfidenceInput.value = data.percent;
+        } catch (err) {
+          // ignore
+        }
+      }
+
+      saveConfidenceBtn.addEventListener("click", async () => {
+        const percent = Number(minConfidenceInput.value);
+        if (Number.isNaN(percent) || percent < 0 || percent > 100) {
+          showToast("请输入 0-100 之间的数字");
+          return;
+        }
+        try {
+          await apiFetch("/api/min-confidence", { method: "POST", body: JSON.stringify({ percent }) });
+          showToast("已保存置信度阈值");
         } catch (err) {
           showToast(err.message);
         }
@@ -1771,7 +1820,7 @@
           const scoreText = typeof item.match_score === "number" ? `${(item.match_score * 100).toFixed(0)}%` : "-";
           return `
             <div class="intent-wrap">
-              <span class="intent-badge hit">✨ AI 识别：命中相关资料（匹配度 ${scoreText}）</span>
+              <span class="intent-badge hit">✨ AI 识别：命中相关资料（置信度 ${scoreText}）</span>
               <div class="msg-badges">${badgesHtml}</div>
               <div class="intent-card">
                 <div class="q">${escapeHtml(item.matched_question || "")}</div>
@@ -1855,15 +1904,20 @@
               <div class="bubble-avatar agent" title="${autoSent ? escapeHtml(item.answered_by_name) : "客服"}">${autoSent ? "🤖" : "🎧"}</div>
             </div>`;
         } else {
-          // 人机协同模式下题库命中：AI 已经生成建议并进入自动发送倒计时，这类问题不算"转人工"，
-          // 不需要客服人工回复，所以不提供回复框——只有真正需要人工处理的问题（题库未命中/全人工
-          // 模式）才会走到下面的回复框分支。
-          const aiHandledInCollab = item.mode_used === "collab" && item.matched === 1;
+          // 人机协同模式下题库命中且已安排自动发送倒计时：这类问题不算"转人工"，不需要客服人工
+          // 回复，所以不提供回复框。命中但置信度低于阈值的对话没有 auto_send_at（不会自动发送，
+          // 必须人工确认），和题库未命中/全人工模式一样走下面的回复框分支。
+          const aiHandledInCollab = item.mode_used === "collab" && item.matched === 1 && item.auto_send_at;
 
           if (item.ai_suggested_answer) {
+            // 有 auto_send_at 才是"倒计时结束会自动发送"的建议；没有则是置信度未达阈值、
+            // 仅供客服参考的草稿（回复框里已预填，客服可直接采纳或改写后发送）。
+            const draftLabel = item.auto_send_at
+              ? "💡 AI 建议回复（未发送，将自动发送给客户）"
+              : "💡 AI 建议回复（置信度未达阈值，不会自动发送，请客服确认后发送）";
             html += `
               <div class="draft-wrap">
-                <div class="draft-label">💡 AI 建议回复（未发送，将自动发送给客户）</div>
+                <div class="draft-label">${draftLabel}</div>
                 <div class="draft-box">${escapeHtml(item.ai_suggested_answer)}</div>
               </div>`;
           }
