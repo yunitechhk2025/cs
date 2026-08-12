@@ -1368,6 +1368,12 @@ WA_UNSUPPORTED_TEXT = "抱歉，目前只能处理文字和图片消息，麻烦
 # 客户想换一款产品咨询时的口语说法（网页端是点"切换产品"链接，WhatsApp 只能靠关键词）
 WA_SWITCH_PRODUCT_KEYWORDS = ("切换产品", "换产品", "换个产品", "重新选择", "选择产品", "选产品")
 WA_PRODUCT_BUTTON_PREFIX = "product:"
+# WhatsApp 客户十有八九先发一句"你好"再问正事。这类开场白不能当成待回答的问题存起来，
+# 否则客户选完产品后会立刻收到一句"您的问题和本产品无关"，显得莫名其妙。
+WA_GREETING_WORDS = (
+    "你好", "您好", "哈罗", "哈啰", "喂", "在吗", "在么", "有人吗", "请问",
+    "hi", "hello", "hey", "helo", "早上好", "下午好", "晚上好", "打扰了",
+)
 WA_MIME_EXTS = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -1490,6 +1496,19 @@ async def _handle_whatsapp_interactive(wa_id: str, interactive: dict) -> None:
     await whatsapp.send_text(wa_id, WA_PRODUCT_CHOSEN_TEXT)
 
 
+def _is_greeting_only(text: str) -> bool:
+    """判断这句话除了打招呼之外还有没有实际内容。
+
+    把所有开场白词和标点去掉后，剩下的字符太少就认为只是打招呼："你好" → 空，
+    "你好在吗" → 空，都算；而"你好，孕妇能用吗"去掉"你好"后还剩一整个问题，不算。
+    """
+    stripped = text.lower()
+    for word in WA_GREETING_WORDS:
+        stripped = stripped.replace(word, "")
+    stripped = re.sub(r"[\s\W_]+", "", stripped, flags=re.UNICODE)
+    return len(stripped) <= 3
+
+
 async def _handle_whatsapp_text(wa_id: str, contact: dict, text: str) -> None:
     if not text:
         return
@@ -1497,7 +1516,10 @@ async def _handle_whatsapp_text(wa_id: str, contact: dict, text: str) -> None:
         await _send_whatsapp_product_picker(wa_id, WA_PRODUCT_PROMPT)
         return
     if not contact.get("product"):
-        database.set_whatsapp_pending_question(wa_id, text)
+        # 只有确实带着问题的开场消息才留着，选完产品后自动作答；纯打招呼不留，
+        # 选完产品后回一句"请问想咨询什么？"就好。
+        if not _is_greeting_only(text):
+            database.set_whatsapp_pending_question(wa_id, text)
         await _send_whatsapp_product_picker(wa_id, WA_WELCOME_TEXT)
         return
     awaiting_id = contact.get("awaiting_transfer_conversation_id")
