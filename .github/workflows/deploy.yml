@@ -115,7 +115,19 @@ jobs:
 
             echo "==> [2/5] fetch latest code"
             rm -rf /tmp/cs-src
-            git clone --depth 1 --branch main https://github.com/yunitechhk2025/cs.git /tmp/cs-src
+            # 这台 ECS 连 github.com 偶发超时（默认要卡两分多钟才报错）。用 lowSpeed 参数让
+            # 单次尝试 30 秒内没速度就失败，再重试三次，避免一次网络抖动就让整个部署挂掉。
+            for i in 1 2 3; do
+              if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                   clone --depth 1 --branch main \
+                   https://github.com/yunitechhk2025/cs.git /tmp/cs-src; then
+                break
+              fi
+              echo "==> clone 第 ${i} 次失败，等 15 秒后重试"
+              rm -rf /tmp/cs-src
+              sleep 15
+            done
+            test -d /tmp/cs-src || { echo "ERROR: 连续三次无法从 GitHub 拉取代码" >&2; exit 1; }
             cp -a /tmp/cs-src/. ~/cs/
             rm -rf /tmp/cs-src
             git -C ~/cs log -1 --oneline || true
