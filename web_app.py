@@ -1359,7 +1359,9 @@ async def submit_transfer_question(conversation_id: int, req: TransferQuestionRe
 
 WA_WELCOME_TEXT = f"您好，我是 {BRAND_NAME} AI 客服～请先选择您要咨询的产品："
 WA_PRODUCT_PROMPT = "请选择您要咨询的产品："
-WA_PRODUCT_CHOSEN_TEXT = "好的，请问想咨询什么？"
+# 「换产品」这个入口只能靠客户打关键词触发，WhatsApp 里没有网页那种常驻链接，
+# 所以必须在选完产品的这条提示里说出来，否则客户根本不知道有这个功能。
+WA_PRODUCT_CHOSEN_TEXT = "好的，请问想咨询什么？\n（想咨询其他产品，随时回复「换产品」）"
 WA_TRANSFER_PENDING_TEXT = "已收到您的问题，正在为您转接人工客服，请稍候～"
 WA_TRANSFER_DETAILS_TEXT = "好的，请把您想咨询的问题发给我，我马上转给人工客服～"
 WA_IMAGE_ONLY_TEXT = "已收到您的图片～请问想咨询这张图片的什么问题呢？"
