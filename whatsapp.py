@@ -63,9 +63,18 @@ def check_signature(raw_body: bytes, header: Optional[str]) -> bool:
         print("[warn] 未配置 WHATSAPP_APP_SECRET，跳过 webhook 签名校验", file=sys.stderr)
         return True
     if not header or not header.startswith("sha256="):
+        print("[warn] webhook 请求没带 X-Hub-Signature-256 签名头，已拒绝", file=sys.stderr)
         return False
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header[len("sha256=") :].strip())
+    if not hmac.compare_digest(expected, header[len("sha256=") :].strip()):
+        # 接入阶段最难查的一种失败：Meta 已经把消息推过来了，但因为 app secret 配错被
+        # 静默拒绝，表现和"完全没收到消息"一模一样，所以这里必须留一条明确的日志。
+        print(
+            "[warn] webhook 签名校验失败，请检查 WHATSAPP_APP_SECRET 是否为该 App 的应用密钥",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def split_text(text: str) -> List[str]:

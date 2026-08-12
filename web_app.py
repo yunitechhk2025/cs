@@ -1390,6 +1390,9 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> dic
     Meta 要求 20 秒内返回 200，否则会判定失败并不断重推同一条消息；而识别图片、调用 AI
     生成回答远不止 20 秒，所以这里只做签名校验和解析，真正的处理丢进后台任务，立刻应答。"""
     raw = await request.body()
+    # 接入排查用：只要 Meta 真的推到了服务器，这里一定有输出。日志里连这条都没有，
+    # 说明消息根本没送达（多半是 webhook 没订阅 messages 字段，或号码没接进这个 App）。
+    print(f"[info] 收到 WhatsApp webhook 推送 {len(raw)} 字节", file=sys.stderr)
     if not whatsapp.check_signature(raw, request.headers.get("X-Hub-Signature-256")):
         raise HTTPException(status_code=403, detail="签名校验失败")
     try:
