@@ -315,6 +315,12 @@ def agent_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "agent.html")
 
 
+@app.get("/privacy")
+def privacy_page() -> FileResponse:
+    """Meta 要求 App 发布前必须填一个真实可访问的隐私政策地址，这个页面就是拿来填那一栏的。"""
+    return FileResponse(STATIC_DIR / "privacy.html")
+
+
 @app.get("/health")
 def health() -> dict:
     return {
